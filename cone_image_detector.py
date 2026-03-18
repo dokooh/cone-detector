@@ -43,9 +43,17 @@ Usage
         --target_fps 2 \
         --visualize
 
+    # From a GLB/GLTF 3-D mesh (synthetic camera views generated automatically):
+    python cone_image_detector.py \
+        --glb       scene.glb \
+        --output_dir cone_results \
+        --conf 0.35 \
+        --visualize
+
 Dependencies
 ------------
     pip install ultralytics open3d numpy pillow scipy opencv-python-headless
+    pip install trimesh          # optional – GLB fallback when open3d is absent
 """
 
 from __future__ import annotations
@@ -86,6 +94,12 @@ try:
     HAS_SCIPY = True
 except ImportError:
     HAS_SCIPY = False
+
+try:
+    import trimesh as _trimesh
+    HAS_TRIMESH = True
+except ImportError:
+    HAS_TRIMESH = False
 
 try:
     import torch
@@ -218,7 +232,7 @@ def load_predictions(path: str) -> dict:
     """
     p = Path(path)
     if p.is_dir():
-        for pattern in ("*.pkl", "*.npy", "*.npz"):
+        for pattern in ("*.pkl", "*.npy", "*.npz", "*.glb", "*.gltf"):
             hits = sorted(p.glob(pattern))
             if hits:
                 p = hits[0]
@@ -235,6 +249,8 @@ def load_predictions(path: str) -> dict:
         data = dict(np.load(p, allow_pickle=True))
     elif p.suffix == ".npy":
         data = np.load(p, allow_pickle=True).item()
+    elif p.suffix.lower() in (".glb", ".gltf"):
+        return _load_glb_as_pred(str(p))
     else:
         raise ValueError(f"Unsupported format: {p.suffix}")
 
@@ -256,6 +272,197 @@ def _to_numpy_recursive(obj):
     if isinstance(obj, (list, tuple)):
         return type(obj)(_to_numpy_recursive(v) for v in obj)
     return obj
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GLB / GLTF loader  (mesh → synthetic camera prediction dict)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _load_glb_pointcloud(glb_path: str, n_sample: int = 100_000) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Load a GLB/GLTF mesh and return sampled surface points.
+
+    Returns
+    -------
+    xyz : (N, 3) float64  – world-space positions
+    rgb : (N, 3) float32  – colours in [0, 1]
+    """
+    p = str(glb_path)
+
+    # ── Try Open3D first (reads GLB as a triangle mesh) ───────────────────────
+    if HAS_O3D:
+        try:
+            mesh = o3d.io.read_triangle_mesh(p)
+            if len(mesh.vertices) > 0:
+                n_pts = max(n_sample, len(mesh.vertices) * 5)
+                pcd = mesh.sample_points_uniformly(number_of_points=n_pts)
+                xyz = np.asarray(pcd.points, dtype=np.float64)
+                rgb = (
+                    np.asarray(pcd.colors, dtype=np.float32)
+                    if pcd.has_colors()
+                    else np.full((len(xyz), 3), 0.7, dtype=np.float32)
+                )
+                log.info(f"GLB loaded via Open3D: {len(xyz)} points sampled from {p}")
+                return xyz, rgb
+        except Exception as exc:
+            log.warning(f"Open3D GLB load failed ({exc}), trying trimesh")
+
+    # ── trimesh fallback ──────────────────────────────────────────────────────
+    if HAS_TRIMESH:
+        import trimesh as tm
+        scene = tm.load(p)
+        meshes = (
+            list(scene.geometry.values())
+            if hasattr(scene, "geometry")
+            else [scene]
+        )
+        all_xyz: List[np.ndarray] = []
+        all_rgb: List[np.ndarray] = []
+        for mesh in meshes:
+            if not hasattr(mesh, "vertices"):
+                continue
+            verts = np.array(mesh.vertices, dtype=np.float64)
+            all_xyz.append(verts)
+            vc = getattr(getattr(mesh, "visual", None), "vertex_colors", None)
+            if vc is not None:
+                all_rgb.append(np.array(vc, dtype=np.float32)[:, :3] / 255.0)
+            else:
+                all_rgb.append(np.full((len(verts), 3), 0.7, dtype=np.float32))
+
+        if all_xyz:
+            xyz = np.concatenate(all_xyz)
+            rgb = np.concatenate(all_rgb)
+            if len(xyz) > n_sample:
+                idx = np.random.choice(len(xyz), n_sample, replace=False)
+                xyz, rgb = xyz[idx], rgb[idx]
+            log.info(f"GLB loaded via trimesh: {len(xyz)} points from {p}")
+            return xyz, rgb
+
+    raise RuntimeError(
+        f"Cannot load GLB: {glb_path}\n"
+        "Install open3d or trimesh:  pip install open3d trimesh"
+    )
+
+
+def _load_glb_as_pred(
+    path: str,
+    img_h: int = 512,
+    img_w: int = 512,
+    n_cameras: int = 4,
+    n_sample_pts: int = 100_000,
+    camera_dist_factor: float = 2.5,
+) -> dict:
+    """
+    Convert a GLB/GLTF mesh file to a VGGT-compatible prediction dict by
+    sampling a point cloud from the mesh surface and rendering synthetic
+    perspective views around the scene.
+
+    Parameters
+    ----------
+    path               : Path to the .glb or .gltf file.
+    img_h / img_w      : Height / width of each synthetic rendered frame.
+    n_cameras          : Number of camera views evenly spaced in azimuth.
+    n_sample_pts       : Points sampled from the mesh surface.
+    camera_dist_factor : Camera orbit radius as a multiple of the scene radius.
+
+    Returns
+    -------
+    Prediction dict with keys: world_points (S,H,W,3), images (S,3,H,W),
+                               extrinsic (S,3,4), intrinsic (S,3,3),
+                               world_points_conf (S,H,W)
+    """
+    xyz, rgb = _load_glb_pointcloud(path, n_sample_pts)
+
+    centroid = xyz.mean(axis=0)
+    xyz_c = xyz - centroid                                     # centred coords
+    scene_radius = float(np.percentile(np.linalg.norm(xyz_c, axis=1), 95))
+    if scene_radius < 1e-6:
+        scene_radius = 1.0
+    cam_dist = scene_radius * camera_dist_factor
+
+    # Intrinsic matrix for ~60° horizontal FoV
+    fx = fy = img_w / (2.0 * np.tan(np.radians(30.0)))
+    cx, cy = img_w / 2.0, img_h / 2.0
+    K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+
+    world_pts_list: List[np.ndarray] = []
+    images_list:    List[np.ndarray] = []
+    extrin_list:    List[np.ndarray] = []
+    intrin_list:    List[np.ndarray] = []
+    conf_list:      List[np.ndarray] = []
+
+    azimuths  = np.linspace(0.0, 2.0 * np.pi, n_cameras, endpoint=False)
+    elevation = np.radians(20.0)   # slight downward angle
+
+    for az in azimuths:
+        # Camera position on a sphere around the scene centroid
+        cam_pos = np.array([
+            cam_dist * np.cos(az) * np.cos(elevation),
+            cam_dist * np.sin(az) * np.cos(elevation),
+            cam_dist * np.sin(elevation),
+        ])
+
+        # Camera axes: look toward origin, Z-up
+        forward = -cam_pos / np.linalg.norm(cam_pos)
+        up_ref  = np.array([0.0, 0.0, 1.0])
+        right   = np.cross(forward, up_ref)
+        if np.linalg.norm(right) < 1e-6:
+            up_ref = np.array([0.0, 1.0, 0.0])
+            right  = np.cross(forward, up_ref)
+        right /= np.linalg.norm(right)
+        up_cam = np.cross(right, forward)
+
+        # World-to-camera extrinsic  [R | t]  (3×4)
+        R_wc = np.stack([right, up_cam, forward], axis=0)   # (3, 3)
+        t_wc = -(R_wc @ cam_pos)                            # (3,)
+        extrinsic = np.concatenate([R_wc, t_wc[:, None]], axis=1)  # (3, 4)
+
+        # Project all centred points into this camera
+        pts_cam = (R_wc @ xyz_c.T).T + t_wc   # (N, 3)
+        in_front = pts_cam[:, 2] > 0
+        pts_f  = pts_cam[in_front]
+        rgb_f  = rgb[in_front]
+        xyz_f  = xyz[in_front]                 # original world coords
+
+        world_pts_frame = np.zeros((img_h, img_w, 3), dtype=np.float64)
+        img_hwc         = np.zeros((img_h, img_w, 3), dtype=np.float32)
+        conf_frame      = np.zeros((img_h, img_w),    dtype=np.float32)
+
+        if len(pts_f) > 0:
+            u = (pts_f[:, 0] * fx / pts_f[:, 2] + cx).astype(int)
+            v = (pts_f[:, 1] * fy / pts_f[:, 2] + cy).astype(int)
+            in_img = (u >= 0) & (u < img_w) & (v >= 0) & (v < img_h)
+            u, v   = u[in_img], v[in_img]
+            rgb_m  = rgb_f[in_img]
+            xyz_m  = xyz_f[in_img]
+            dep_m  = pts_f[in_img, 2]
+
+            # Painter's algorithm (far → near) so nearest point wins
+            order = np.argsort(dep_m)[::-1]
+            u, v, rgb_m, xyz_m = u[order], v[order], rgb_m[order], xyz_m[order]
+
+            world_pts_frame[v, u] = xyz_m
+            img_hwc[v, u]         = rgb_m
+            conf_frame[v, u]      = 1.0
+
+        world_pts_list.append(world_pts_frame[None])              # (1,H,W,3)
+        images_list.append(img_hwc.transpose(2, 0, 1)[None])     # (1,3,H,W)
+        extrin_list.append(extrinsic[None])                       # (1,3,4)
+        intrin_list.append(K[None])                               # (1,3,3)
+        conf_list.append(conf_frame[None])                        # (1,H,W)
+
+    pred = {
+        "world_points":      np.concatenate(world_pts_list).astype(np.float64),  # (S,H,W,3)
+        "images":            np.concatenate(images_list).astype(np.float32),      # (S,3,H,W)
+        "extrinsic":         np.concatenate(extrin_list).astype(np.float64),      # (S,3,4)
+        "intrinsic":         np.concatenate(intrin_list).astype(np.float64),      # (S,3,3)
+        "world_points_conf": np.concatenate(conf_list).astype(np.float32),        # (S,H,W)
+    }
+    log.info(
+        f"GLB prediction dict: world_points {pred['world_points'].shape}, "
+        f"images {pred['images'].shape}  ({n_cameras} synthetic views)"
+    )
+    return pred
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1012,6 +1219,14 @@ def build_parser() -> argparse.ArgumentParser:
     src.add_argument("--pred_dir",  type=str, help="Directory containing VGGT prediction files")
     src.add_argument("--pred_npy",  type=str, help="Path to VGGT predictions .npy file")
     src.add_argument(
+        "--glb", type=str,
+        help=(
+            "Path to a .glb or .gltf 3-D mesh file. "
+            "Synthetic camera views are generated automatically from the mesh surface "
+            "and fed into the cone-detection pipeline."
+        ),
+    )
+    src.add_argument(
         "--video", type=str,
         help=(
             "Path to a video file (.mp4/.avi/.mov/etc.). "
@@ -1078,6 +1293,10 @@ def main():
             vggt_model_path=args.vggt_model,
             save_predictions=not args.no_save_pred,
         )
+    elif args.glb:
+        # ── Load GLB/GLTF mesh and generate synthetic prediction dict ─────────
+        log.info(f"Input mode: GLB  →  {args.glb}")
+        pred = load_predictions(args.glb)
     else:
         # ── Load pre-computed predictions ─────────────────────────────────────
         pred_path = args.pred_pkl or args.pred_dir or args.pred_npy
