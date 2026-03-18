@@ -23,16 +23,25 @@ Strategy
 
 Usage
 -----
+    # From a pre-computed VGGT prediction file:
     python cone_image_detector.py \
         --pred_pkl  predictions/scene.pkl \
         --output_dir cone_results \
         --conf 0.35 \
         --visualize
 
-    # or point at a directory produced by vggt_video_inference.py:
+    # From a directory of prediction files produced by vggt_video_inference.py:
     python cone_image_detector.py \
         --pred_dir  /kaggle/working/predictions \
         --output_dir cone_results
+
+    # End-to-end from a raw video (runs VGGT reconstruction first):
+    python cone_image_detector.py \
+        --video     site_footage.mp4 \
+        --output_dir cone_results \
+        --max_frames 60 \
+        --target_fps 2 \
+        --visualize
 
 Dependencies
 ------------
@@ -77,6 +86,15 @@ try:
     HAS_SCIPY = True
 except ImportError:
     HAS_SCIPY = False
+
+try:
+    import torch
+    from vggt.models.vggt import VGGT
+    from vggt.utils.load_fn import load_and_preprocess_images
+    from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+    HAS_VGGT = True
+except ImportError:
+    HAS_VGGT = False
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
@@ -238,6 +256,191 @@ def _to_numpy_recursive(obj):
     if isinstance(obj, (list, tuple)):
         return type(obj)(_to_numpy_recursive(v) for v in obj)
     return obj
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Step 0 – VGGT Reconstruction from Video
+# ══════════════════════════════════════════════════════════════════════════════
+
+def extract_frames_from_video(
+    video_path: str,
+    out_dir: Path,
+    max_frames: int = 60,
+    target_fps: Optional[float] = None,
+) -> List[str]:
+    """
+    Extract frames from a video file and save them as PNGs.
+
+    Parameters
+    ----------
+    video_path  : Path to the input video file.
+    out_dir     : Directory to write extracted frames.
+    max_frames  : Hard cap on the number of frames extracted.
+    target_fps  : Sub-sample the video to approximately this frame rate
+                  before passing to VGGT.  None = keep all frames up to
+                  max_frames without sub-sampling.
+
+    Returns
+    -------
+    Sorted list of absolute paths to the extracted PNG files.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise IOError(f"Cannot open video: {video_path}")
+
+    native_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    step = max(1, int(round(native_fps / target_fps))) if target_fps else 1
+    log.info(
+        f"Video: {total_frames} frames @ {native_fps:.1f} fps  "
+        f"→ sampling every {step} frame(s), cap={max_frames}"
+    )
+
+    saved: List[str] = []
+    frame_idx = 0
+    while len(saved) < max_frames:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if frame_idx % step == 0:
+            fname = out_dir / f"frame_{len(saved):05d}.png"
+            cv2.imwrite(str(fname), frame)
+            saved.append(str(fname))
+        frame_idx += 1
+
+    cap.release()
+    log.info(f"Extracted {len(saved)} frames to {out_dir}")
+    return sorted(saved)
+
+
+def vggt_reconstruct_from_video(
+    video_path: str,
+    output_dir: str = "cone_results",
+    max_frames: int = 60,
+    target_fps: Optional[float] = 2.0,
+    device: Optional[str] = None,
+    vggt_model_path: Optional[str] = None,
+    save_predictions: bool = True,
+) -> dict:
+    """
+    Run VGGT reconstruction on a video file and return a prediction dict
+    that is ready to be passed directly to :func:`run_pipeline`.
+
+    This is Step 0 of the end-to-end pipeline:
+        video → frame extraction → VGGT inference → prediction dict
+                                                        ↓
+                                              run_pipeline (cone detection)
+
+    Parameters
+    ----------
+    video_path        : Path to the input video (.mp4 / .avi / .mov, etc.).
+    output_dir        : Root output directory; frames and predictions are
+                        persisted here.
+    max_frames        : Maximum number of frames to extract and feed to VGGT.
+                        More frames → richer reconstruction but slower inference.
+    target_fps        : Sub-sample video to approximately this frame rate
+                        before VGGT.  None = use all frames up to max_frames.
+    device            : ``'cuda'`` / ``'cpu'``.  Defaults to CUDA if available.
+    vggt_model_path   : Local path to VGGT weights (.pt).  If None the weights
+                        are downloaded from HuggingFace (facebook/VGGT-1B).
+    save_predictions  : Persist the prediction dict as ``predictions.pkl``
+                        inside output_dir so it can be reused without
+                        re-running VGGT.
+
+    Returns
+    -------
+    dict with keys: world_points (S,H,W,3), images (S,3,H,W),
+                    extrinsic (S,3,4), intrinsic (S,3,3),
+                    depth (S,H,W,1), depth_conf (S,H,W),
+                    world_points_conf (S,H,W)
+    """
+    if not HAS_VGGT:
+        raise RuntimeError(
+            "The vggt package is required for video reconstruction.\n"
+            "Install with:  pip install vggt\n"
+            "Or obtain it from:  https://github.com/facebookresearch/vggt"
+        )
+
+    import pickle as _pkl  # already in stdlib; only needed locally here
+
+    out_dir = Path(output_dir)
+    frames_dir = out_dir / "extracted_frames"
+
+    # ── 0.1  Extract frames ───────────────────────────────────────────────────
+    log.info("Step 0.1 – Extracting frames from video")
+    frame_paths = extract_frames_from_video(
+        video_path, frames_dir, max_frames=max_frames, target_fps=target_fps
+    )
+    if not frame_paths:
+        raise RuntimeError(f"No frames could be extracted from video: {video_path}")
+
+    # ── 0.2  Load VGGT model ──────────────────────────────────────────────────
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    log.info(f"Step 0.2 – Loading VGGT model (device={device})")
+
+    model = VGGT()
+    if vggt_model_path and Path(vggt_model_path).exists():
+        state = torch.load(vggt_model_path, map_location="cpu")
+        model.load_state_dict(state)
+        log.info(f"  Loaded weights from {vggt_model_path}")
+    else:
+        _URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
+        log.info("  Downloading VGGT weights from HuggingFace …")
+        model.load_state_dict(
+            torch.hub.load_state_dict_from_url(_URL, map_location="cpu")
+        )
+
+    model.eval()
+    model = model.to(device)
+
+    # ── 0.3  Pre-process images ───────────────────────────────────────────────
+    log.info(f"Step 0.3 – Pre-processing {len(frame_paths)} frames")
+    images = load_and_preprocess_images(frame_paths).to(device)
+    log.info(f"  Image tensor shape: {tuple(images.shape)}")
+
+    # ── 0.4  VGGT inference ───────────────────────────────────────────────────
+    log.info("Step 0.4 – Running VGGT inference")
+    use_amp = device == "cuda"
+    dtype = torch.float16
+    if use_amp and torch.cuda.get_device_capability(0)[0] >= 8:
+        dtype = torch.bfloat16
+
+    with torch.no_grad():
+        with torch.cuda.amp.autocast(dtype=dtype, enabled=use_amp):
+            predictions = model(images)
+
+    # ── 0.5  Decode pose encoding → extrinsic / intrinsic matrices ───────────
+    log.info("Step 0.5 – Converting pose encoding to camera matrices")
+    extrinsic, intrinsic = pose_encoding_to_extri_intri(
+        predictions["pose_enc"], images.shape[-2:]
+    )
+    predictions["extrinsic"] = extrinsic
+    predictions["intrinsic"] = intrinsic
+
+    # ── 0.6  Move everything to CPU numpy (strip batch dimension) ─────────────
+    pred_np: dict = {}
+    for key, val in predictions.items():
+        if isinstance(val, torch.Tensor):
+            pred_np[key] = val.detach().cpu().numpy().squeeze(0)
+        else:
+            pred_np[key] = val
+
+    log.info(
+        f"  Reconstruction complete:  "
+        f"world_points {pred_np['world_points'].shape},  "
+        f"images {pred_np['images'].shape}"
+    )
+
+    # ── 0.7  Optionally persist predictions ───────────────────────────────────
+    if save_predictions:
+        pred_path = out_dir / "predictions.pkl"
+        with open(pred_path, "wb") as f:
+            _pkl.dump(pred_np, f)
+        log.info(f"  Predictions saved to {pred_path}")
+
+    return pred_np
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -808,6 +1011,43 @@ def build_parser() -> argparse.ArgumentParser:
     src.add_argument("--pred_pkl",  type=str, help="Path to VGGT predictions .pkl file")
     src.add_argument("--pred_dir",  type=str, help="Directory containing VGGT prediction files")
     src.add_argument("--pred_npy",  type=str, help="Path to VGGT predictions .npy file")
+    src.add_argument(
+        "--video", type=str,
+        help=(
+            "Path to a video file (.mp4/.avi/.mov/etc.). "
+            "Triggers Step 0: VGGT reconstruction is run on extracted frames "
+            "before cone detection."
+        ),
+    )
+
+    # ── VGGT reconstruction options (only relevant when --video is given) ─────
+    p.add_argument(
+        "--max_frames", type=int, default=60,
+        help="(--video) Maximum number of frames extracted from the video.",
+    )
+    p.add_argument(
+        "--target_fps", type=float, default=2.0,
+        help=(
+            "(--video) Sub-sample video to approximately this frame rate "
+            "before VGGT inference. Use 0 to keep all frames up to --max_frames."
+        ),
+    )
+    p.add_argument(
+        "--vggt_model", type=str, default=None,
+        help=(
+            "(--video) Path to local VGGT weights (.pt). "
+            "If omitted the model is downloaded from HuggingFace."
+        ),
+    )
+    p.add_argument(
+        "--device", type=str, default=None,
+        help="(--video) Compute device for VGGT inference: 'cuda' or 'cpu'. "
+             "Defaults to CUDA when available.",
+    )
+    p.add_argument(
+        "--no_save_pred", action="store_true",
+        help="(--video) Skip saving the VGGT prediction dict to predictions.pkl.",
+    )
 
     p.add_argument("--model",      type=str, default="yolov8n.pt",
                    help="YOLOv8 weights (use cone-specific checkpoint for best results)")
@@ -826,8 +1066,22 @@ def build_parser() -> argparse.ArgumentParser:
 def main():
     args = build_parser().parse_args()
 
-    pred_path = args.pred_pkl or args.pred_dir or args.pred_npy
-    pred = load_predictions(pred_path)
+    if args.video:
+        # ── Step 0: VGGT reconstruction from raw video ────────────────────────
+        log.info(f"Input mode: video  →  {args.video}")
+        pred = vggt_reconstruct_from_video(
+            video_path=args.video,
+            output_dir=args.output_dir,
+            max_frames=args.max_frames,
+            target_fps=args.target_fps if args.target_fps > 0 else None,
+            device=args.device,
+            vggt_model_path=args.vggt_model,
+            save_predictions=not args.no_save_pred,
+        )
+    else:
+        # ── Load pre-computed predictions ─────────────────────────────────────
+        pred_path = args.pred_pkl or args.pred_dir or args.pred_npy
+        pred = load_predictions(pred_path)
 
     cones = run_pipeline(
         pred=pred,
