@@ -25,14 +25,15 @@ Usage
     detector = ConeDetector()
     cones = detector.detect_from_segments(segments)
 
-# From a raw .ply file:
-    cones = detector.detect_from_file("scene.ply")
+# From a raw .ply / .glb file:
+    cones = detector.detect_from_file("scene.ply")   # or "scene.glb"
 
 # From a raw numpy array (Nx3 XYZ or Nx6 XYZRGB):
     cones = detector.detect_from_pointcloud(points)
 
 # CLI:
     python cone_detector.py --input scene.ply --visualize
+    python cone_detector.py --input scene.glb --visualize
 """
 
 from __future__ import annotations
@@ -57,6 +58,12 @@ try:
     HAS_SKLEARN = True
 except ImportError:
     HAS_SKLEARN = False
+
+try:
+    import trimesh
+    HAS_TRIMESH = True
+except ImportError:
+    HAS_TRIMESH = False
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
@@ -245,7 +252,7 @@ class ConeDetector:
     # ──────────────────────────────────────────────────────────────────────────
 
     def detect_from_file(self, path: str) -> List[DetectedCone]:
-        """Load a .ply / .pcd file and detect cones."""
+        """Load a .ply / .pcd / .glb / .gltf file and detect cones."""
         points = self._load_pointcloud(path)
         return self.detect_from_pointcloud(points)
 
@@ -464,7 +471,11 @@ class ConeDetector:
     # ──────────────────────────────────────────────────────────────────────────
 
     def _load_pointcloud(self, path: str) -> np.ndarray:
-        """Load a point cloud from .ply / .pcd → Nx3 or Nx6 numpy array."""
+        """Load a point cloud from .ply / .pcd / .glb / .gltf → Nx3 or Nx6 numpy array."""
+        ext = Path(path).suffix.lower()
+        if ext in (".glb", ".gltf"):
+            return self._load_glb(path)
+
         if not HAS_O3D:
             raise RuntimeError(
                 "open3d is required to load .ply/.pcd files.\n"
@@ -477,6 +488,68 @@ class ConeDetector:
             pts = np.hstack([pts, colors])
         log.info(f"Loaded '{path}': {len(pts):,} points")
         return pts
+
+    def _load_glb(self, path: str) -> np.ndarray:
+        """
+        Load a .glb / .gltf mesh file and convert to a point cloud.
+
+        Strategy
+        --------
+        1. Try Open3D: read as a triangle mesh, then sample points uniformly
+           from the surface so density is proportional to surface area.
+        2. Fallback to trimesh: concatenate all sub-meshes and use vertices
+           (plus vertex colours when available).
+        """
+        # ── Open3D path ───────────────────────────────────────────────────────
+        if HAS_O3D:
+            try:
+                mesh = o3d.io.read_triangle_mesh(path)
+                mesh.compute_vertex_normals()
+                n_verts = len(mesh.vertices)
+                if n_verts == 0:
+                    raise ValueError("Empty mesh returned by Open3D.")
+                # Sample at least 10 000 points; scale with mesh complexity
+                n_sample = max(10_000, n_verts * 5)
+                pcd = mesh.sample_points_uniformly(number_of_points=n_sample)
+                pts = np.asarray(pcd.points, dtype=np.float64)
+                if pcd.has_colors():
+                    colors = np.asarray(pcd.colors) * 255.0
+                    pts = np.hstack([pts, colors])
+                log.info(
+                    f"Loaded GLB '{path}' via Open3D: "
+                    f"{len(pts):,} points sampled from {n_verts:,} vertices"
+                )
+                return pts
+            except Exception as exc:
+                log.warning(f"Open3D GLB load failed ({exc}); trying trimesh.")
+
+        # ── trimesh fallback ──────────────────────────────────────────────────
+        if HAS_TRIMESH:
+            loaded = trimesh.load(path, force="mesh", process=False)
+            if isinstance(loaded, trimesh.Scene):
+                meshes = list(loaded.geometry.values())
+                if not meshes:
+                    raise ValueError(f"No geometry found in GLB scene: {path}")
+                combined = trimesh.util.concatenate(meshes)
+            else:
+                combined = loaded
+
+            pts = np.asarray(combined.vertices, dtype=np.float64)
+
+            # Vertex colours (RGBA uint8 → RGB float64 0-255)
+            try:
+                vc = combined.visual.to_color().vertex_colors  # RGBA uint8
+                pts = np.hstack([pts, vc[:, :3].astype(np.float64)])
+            except Exception:
+                pass  # colours unavailable – continue with XYZ only
+
+            log.info(f"Loaded GLB '{path}' via trimesh: {len(pts):,} points")
+            return pts
+
+        raise RuntimeError(
+            "open3d or trimesh is required to load .glb/.gltf files.\n"
+            "Install with:  pip install open3d   or   pip install trimesh"
+        )
 
     def save_cones(self, cones: List[DetectedCone], output_dir: str = "cone_detections"):
         """Save each detected cone as a separate .ply file."""
@@ -548,7 +621,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     src = p.add_mutually_exclusive_group(required=True)
-    src.add_argument("--input", type=str, help="Path to .ply / .pcd scene file")
+    src.add_argument("--input", type=str, help="Path to .ply / .pcd / .glb / .gltf scene file")
     src.add_argument(
         "--npy_dir",
         type=str,
