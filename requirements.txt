@@ -1,0 +1,46 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# cone-detector — Python dependencies
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Install everything:
+#   pip install -r requirements.txt
+#
+# Minimal install (geometry-only detector, no YOLO / no file I/O):
+#   pip install numpy scipy scikit-learn
+#
+# Full install (all features including image-pipeline & GLB support):
+#   pip install -r requirements.txt
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── Core (always required) ────────────────────────────────────────────────────
+numpy>=1.21.0
+
+# ── Ground-plane geometry & clustering ───────────────────────────────────────
+scipy>=1.7.0                   # ConvexHull for footprint area
+scikit-learn>=1.0.0            # DBSCAN fallback when open3d is absent
+
+# ── 3-D point cloud I/O & processing (strongly recommended) ──────────────────
+open3d>=0.16.0                 # RANSAC plane fit, DBSCAN, .ply/.pcd I/O,
+                               # triangle-mesh sampling for .glb files
+
+# ── GLB / glTF mesh support (optional, used when open3d GLB load fails) ──────
+trimesh>=3.20.0                # fallback GLB loader
+
+# ── Image-space cone detector (cone_image_detector.py) ───────────────────────
+opencv-python-headless>=4.5.0  # frame rendering & annotation (headless = no Qt)
+ultralytics>=8.0.0             # YOLOv8 inference
+Pillow>=9.0.0                  # image utilities used by ultralytics
+
+# ── VGGT inference pipeline ───────────────────────────────────────────────────
+# NOTE: torch & torchvision are intentionally left unpinned here so that
+#       the correct CUDA-flavoured wheel can be installed separately, e.g.:
+#         pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+torch>=2.0.0
+torchvision>=0.15.0
+einops>=0.6.0                  # required by VGGT model internals
+safetensors>=0.3.0             # fast/safe model weight loading
+huggingface_hub>=0.20.0        # VGGT.from_pretrained("facebook/VGGT-1B")
+
+# ── Kaggle notebook extras ────────────────────────────────────────────────────
+matplotlib>=3.5.0              # inline plot display in notebooks
+tqdm>=4.62.0                   # progress bars
