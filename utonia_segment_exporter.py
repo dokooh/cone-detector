@@ -2,25 +2,45 @@
 utonia_segment_exporter.py
 ==========================
 Reads a color-segmented point cloud produced by Utonia's PCA pipeline
-(.ply with per-point RGB), groups points by their unique segment color,
-writes ONE .ply file per segment color (all similar-colored points merged),
-and prints the height/width of every segmented object.
+(.ply with per-point float RGB in [0,1]), recovers segments by clustering
+the continuous PCA colors, writes ONE .ply file per segment, and prints
+the height / width of every segmented object.
+
+How Utonia colors work (from app.py / get_pca_color)
+-----------------------------------------------------
+Utonia runs torch.pca_lowrank on its feature tensor, then min-max
+normalises the 3-component projection into [0, 1] float RGB.
+Points belonging to the same semantic region share *similar* (not identical)
+RGB values — it is a smooth gradient, not a flat per-segment color.
+
+Segmentation strategy
+---------------------
+We therefore cluster the float RGB vectors directly:
+  • Primary  : K-Means  (fast, works well when you know / estimate K)
+  • Fallback : DBSCAN   (no K needed, but slower on large clouds)
+
+Both are implemented in pure numpy / scipy / sklearn — no torch required.
 
 Usage
 -----
-    python utonia_segment_exporter.py --input segmented_scene.ply
-    python utonia_segment_exporter.py --input segmented_scene.ply --output_dir my_segments --tolerance 3
+    # K-Means with automatic K estimation:
+    python utonia_segment_exporter.py --input scene_pca.ply
+
+    # K-Means with explicit K:
+    python utonia_segment_exporter.py --input scene_pca.ply --n_segments 12
+
+    # DBSCAN (no K):
+    python utonia_segment_exporter.py --input scene_pca.ply --method dbscan --eps 0.05
 
 Requirements
 ------------
-    pip install open3d numpy
+    pip install open3d numpy scikit-learn
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
-from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -30,26 +50,33 @@ try:
 except ImportError:
     sys.exit("open3d is not installed.  Run:  pip install open3d")
 
+try:
+    from sklearn.cluster import KMeans, DBSCAN
+except ImportError:
+    sys.exit("scikit-learn is not installed.  Run:  pip install scikit-learn")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Configuration defaults
 # ══════════════════════════════════════════════════════════════════════════════
 
-DEFAULT_OUTPUT_DIR = "segments_out"
-DEFAULT_COLOR_TOLERANCE = 2   # uint8 rounding bucket size (0 = exact match)
-DEFAULT_MIN_POINTS = 5        # segments smaller than this are discarded
+DEFAULT_OUTPUT_DIR    = "segments_out"
+DEFAULT_N_SEGMENTS    = None   # None → auto-estimate via elbow / gap
+DEFAULT_METHOD        = "kmeans"
+DEFAULT_DBSCAN_EPS    = 0.05   # in [0,1] RGB space
+DEFAULT_DBSCAN_MIN_PTS = 50
+DEFAULT_MIN_POINTS    = 10     # segments smaller than this are noise
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Core logic
+# I/O
 # ══════════════════════════════════════════════════════════════════════════════
 
 def load_pointcloud(path: Path) -> tuple[np.ndarray, np.ndarray]:
     """
-    Load a .ply file and return (xyz, colors).
-
-    xyz    : (N, 3) float64  — XYZ coordinates
-    colors : (N, 3) float64  — RGB in [0, 1] as stored by Open3D
+    Load a .ply and return (xyz, colors).
+      xyz    : (N, 3) float64
+      colors : (N, 3) float64 in [0, 1]  ← Utonia PCA colors
     """
     pcd = o3d.io.read_point_cloud(str(path))
 
@@ -58,186 +85,240 @@ def load_pointcloud(path: Path) -> tuple[np.ndarray, np.ndarray]:
     if not pcd.has_colors():
         sys.exit(
             "ERROR: The point cloud has no color information.\n"
-            "Please supply the Utonia / PCA color-segmented output (.ply with RGB)."
+            "Please supply the Utonia PCA-colored output (.ply with float RGB)."
         )
 
-    xyz    = np.asarray(pcd.points)    # (N, 3) float64
-    colors = np.asarray(pcd.colors)    # (N, 3) float64 in [0, 1]
+    xyz    = np.asarray(pcd.points,  dtype=np.float64)   # (N, 3)
+    colors = np.asarray(pcd.colors,  dtype=np.float64)   # (N, 3) in [0,1]
 
     print(f"Loaded  : {path.name}")
     print(f"Points  : {len(xyz):,}")
     print(
         f"XYZ range  "
-        f"X=[{xyz[:, 0].min():.3f}, {xyz[:, 0].max():.3f}]  "
-        f"Y=[{xyz[:, 1].min():.3f}, {xyz[:, 1].max():.3f}]  "
-        f"Z=[{xyz[:, 2].min():.3f}, {xyz[:, 2].max():.3f}]"
+        f"X=[{xyz[:,0].min():.3f}, {xyz[:,0].max():.3f}]  "
+        f"Y=[{xyz[:,1].min():.3f}, {xyz[:,1].max():.3f}]  "
+        f"Z=[{xyz[:,2].min():.3f}, {xyz[:,2].max():.3f}]"
+    )
+    print(
+        f"RGB range  "
+        f"R=[{colors[:,0].min():.3f}, {colors[:,0].max():.3f}]  "
+        f"G=[{colors[:,1].min():.3f}, {colors[:,1].max():.3f}]  "
+        f"B=[{colors[:,2].min():.3f}, {colors[:,2].max():.3f}]"
     )
     return xyz, colors
 
 
-def _quantise_colors(colors: np.ndarray, tolerance: int) -> np.ndarray:
-    """
-    Convert float [0, 1] RGB to uint8 and snap each channel to the nearest
-    multiple of `tolerance`.
+# ══════════════════════════════════════════════════════════════════════════════
+# PCA color → segment clustering
+# ══════════════════════════════════════════════════════════════════════════════
 
-    Using *round* (not floor-divide) ensures that two values that differ by
-    less than tolerance/2 on every channel map to the same representative
-    and are therefore merged into a single segment — regardless of which
-    side of a bucket boundary they happen to sit on.
+def _estimate_k(colors: np.ndarray, k_min: int = 2, k_max: int = 20) -> int:
+    """
+    Estimate K for K-Means via the elbow method (inertia drop ratio).
+    Runs K-Means for k in [k_min, k_max] on a 50 k-point sub-sample.
+    """
+    # Sub-sample for speed
+    rng = np.random.default_rng(42)
+    idx = rng.choice(len(colors), size=min(50_000, len(colors)), replace=False)
+    sample = colors[idx]
+
+    inertias = []
+    ks = list(range(k_min, k_max + 1))
+    for k in ks:
+        km = KMeans(n_clusters=k, n_init=3, random_state=42, max_iter=100)
+        km.fit(sample)
+        inertias.append(km.inertia_)
+
+    # Elbow: largest second-derivative of inertia
+    if len(inertias) < 3:
+        return k_min
+    d2 = np.diff(np.diff(inertias))
+    best_k = ks[int(np.argmax(d2)) + 1]   # +1 to compensate double diff offset
+    print(f"Auto-estimated K = {best_k}")
+    return best_k
+
+
+def _pca_project(colors: np.ndarray) -> np.ndarray:
+    """
+    Re-apply the same PCA projection that Utonia uses to build the color:
+      1. Center the colors.
+      2. Compute top-3 principal components (numpy SVD).
+      3. Project → (N, 3) float64.
+
+    Clustering in this PCA space is more faithful to the original
+    feature space than clustering raw RGB values directly.
+    """
+    centered = colors - colors.mean(axis=0)
+    # Economy SVD: V has shape (3, 3) for 3-channel input
+    _, _, Vt = np.linalg.svd(centered, full_matrices=False)
+    projected = centered @ Vt.T          # (N, 3)  — same as feat @ v in torch
+    return projected
+
+
+def segment_by_kmeans(
+    colors: np.ndarray,
+    n_segments: int | None = None,
+    min_points: int = DEFAULT_MIN_POINTS,
+) -> np.ndarray:
+    """
+    Cluster PCA colors with K-Means.
 
     Parameters
     ----------
-    colors    : (N, 3) float64 in [0, 1]
-    tolerance : rounding granularity in uint8 space; 0 means exact match
+    colors      : (N, 3) float64 in [0, 1]
+    n_segments  : K; auto-estimated if None
+    min_points  : clusters smaller than this become label -1 (noise)
 
     Returns
     -------
-    (N, 3) uint8 — quantised color key for each point
+    labels : (N,) int  — cluster id per point, -1 = noise
     """
-    colors_u8 = (colors * 255.0).round().astype(np.int16)   # int16 avoids overflow
+    # Project into the same PCA feature space used to generate the colors
+    projected = _pca_project(colors)
 
-    if tolerance > 1:
-        # Round to nearest multiple of tolerance (not floor-divide).
-        # e.g. tolerance=4: 253→252, 254→252, 255→256→clipped to 255
-        colors_q = (np.round(colors_u8 / tolerance) * tolerance).astype(np.int16)
-        colors_q = np.clip(colors_q, 0, 255).astype(np.uint8)
-    elif tolerance == 1:
-        colors_q = colors_u8.clip(0, 255).astype(np.uint8)
-    else:
-        # tolerance == 0 → exact match
-        colors_q = colors_u8.clip(0, 255).astype(np.uint8)
+    k = n_segments if n_segments is not None else _estimate_k(projected)
 
-    return colors_q
+    print(f"Running K-Means with K={k} …")
+    km = KMeans(n_clusters=k, n_init=10, random_state=42, max_iter=300)
+    labels = km.fit_predict(projected).astype(np.int32)
+
+    # Mark tiny clusters as noise
+    for lbl in np.unique(labels):
+        if lbl == -1:
+            continue
+        if (labels == lbl).sum() < min_points:
+            labels[labels == lbl] = -1
+
+    n_valid = len(np.unique(labels[labels != -1]))
+    print(f"K-Means segments (after noise filter): {n_valid}")
+    return labels
 
 
-def group_by_color(
+def segment_by_dbscan(
     colors: np.ndarray,
-    tolerance: int = DEFAULT_COLOR_TOLERANCE,
+    eps: float = DEFAULT_DBSCAN_EPS,
+    min_pts: int = DEFAULT_DBSCAN_MIN_PTS,
     min_points: int = DEFAULT_MIN_POINTS,
-) -> dict[tuple[int, int, int], np.ndarray]:
+) -> np.ndarray:
     """
-    Group point indices by their quantised RGB color so that ALL points
-    belonging to the same Utonia segment end up in exactly one group.
-
-    Utonia assigns a unique flat RGB to each PCA segment, so every group
-    of identically-colored points corresponds to one segment.
+    Cluster PCA colors with DBSCAN.
 
     Parameters
     ----------
     colors     : (N, 3) float64 in [0, 1]
-    tolerance  : rounding granularity in uint8 space (0 = exact match,
-                 2-5 = tolerant, absorbs floating-point rounding)
-    min_points : groups smaller than this are discarded as noise
+    eps        : neighborhood radius in PCA-projected space
+    min_pts    : DBSCAN min_samples
+    min_points : clusters smaller than this become label -1
 
     Returns
     -------
-    dict mapping (R, G, B) uint8 tuple → array of point indices
+    labels : (N,) int  — cluster id per point, -1 = noise
     """
-    colors_q = _quantise_colors(colors, tolerance)   # (N, 3) uint8
+    projected = _pca_project(colors)
 
-    # One pass: accumulate indices per quantised color key.
-    # Using a dict with tuple keys is the most reliable way to guarantee
-    # that every point with the same quantised color lands in the same bucket.
-    groups: dict[tuple[int, int, int], list[int]] = defaultdict(list)
-    for idx in range(len(colors_q)):
-        r, g, b = int(colors_q[idx, 0]), int(colors_q[idx, 1]), int(colors_q[idx, 2])
-        groups[(r, g, b)].append(idx)
+    print(f"Running DBSCAN (eps={eps}, min_samples={min_pts}) …")
+    db = DBSCAN(eps=eps, min_samples=min_pts, n_jobs=-1)
+    labels = db.fit_predict(projected).astype(np.int32)
 
-    # Filter noise groups and convert index lists to numpy arrays
-    segments: dict[tuple[int, int, int], np.ndarray] = {
-        color: np.array(indices, dtype=np.int64)
-        for color, indices in groups.items()
-        if len(indices) >= min_points
-    }
+    # Mark tiny clusters as noise
+    for lbl in np.unique(labels):
+        if lbl == -1:
+            continue
+        if (labels == lbl).sum() < min_points:
+            labels[labels == lbl] = -1
 
-    n_total   = len(groups)
-    n_valid   = len(segments)
-    n_dropped = n_total - n_valid
+    n_valid = len(np.unique(labels[labels != -1]))
+    print(f"DBSCAN segments (after noise filter): {n_valid}  "
+          f"(noise pts: {(labels == -1).sum():,})")
+    return labels
 
-    print(f"\nUnique color groups          : {n_total}")
-    print(f"Valid segments (≥{min_points} pts)   : {n_valid}")
-    print(f"Dropped (too small)          : {n_dropped}")
 
-    return segments
-
+# ══════════════════════════════════════════════════════════════════════════════
+# Export
+# ══════════════════════════════════════════════════════════════════════════════
 
 def save_segments(
     xyz: np.ndarray,
     colors: np.ndarray,
-    segments: dict[tuple[int, int, int], np.ndarray],
+    labels: np.ndarray,
     output_dir: Path,
 ) -> list[Path]:
     """
-    Write ONE .ply file per segment color.
+    Write one .ply per segment label (noise label -1 is skipped).
 
-    All points that share the same quantised RGB (i.e. the same Utonia
-    segment label) are written together into a single file.
+    The exported file keeps the original Utonia PCA float RGB colors so
+    the per-segment files are visually consistent with the full scene.
 
     File naming convention:
-        segment_<id>_rgb<R>-<G>-<B>.ply
+        segment_<id>.ply
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     saved: list[Path] = []
 
-    for seg_id, (color_key, indices) in enumerate(segments.items()):
-        seg_xyz    = xyz[indices]
-        seg_colors = colors[indices]   # float [0, 1] — Open3D expects this
+    unique_labels = sorted(lbl for lbl in np.unique(labels) if lbl != -1)
+
+    for seg_id, lbl in enumerate(unique_labels):
+        mask = labels == lbl
+        seg_xyz    = xyz[mask]
+        seg_colors = colors[mask]
 
         seg_pcd = o3d.geometry.PointCloud()
         seg_pcd.points = o3d.utility.Vector3dVector(seg_xyz)
         seg_pcd.colors = o3d.utility.Vector3dVector(seg_colors)
 
-        r, g, b   = color_key
-        out_file  = output_dir / f"segment_{seg_id:04d}_rgb{r:03d}-{g:03d}-{b:03d}.ply"
+        out_file = output_dir / f"segment_{seg_id:04d}.ply"
         o3d.io.write_point_cloud(str(out_file), seg_pcd)
         saved.append(out_file)
 
     print(f"\nSaved {len(saved)} segment file(s) → '{output_dir.resolve()}'")
-    return saved
+    return saved, unique_labels, labels
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Dimension reporting
+# ══════════════════════════════════════════════════════════════════════════════
 
 def print_dimensions(
     xyz: np.ndarray,
-    segments: dict[tuple[int, int, int], np.ndarray],
+    labels: np.ndarray,
+    unique_labels: list[int],
     saved_paths: list[Path],
 ) -> None:
     """
-    Print the axis-aligned bounding-box dimensions of every segment.
+    Print AABB height / width / depth for every segment.
 
-    Definitions
-    -----------
-    height : Z-axis extent  (z_max − z_min)
-    width  : X-axis extent  (x_max − x_min)
-    depth  : Y-axis extent  (y_max − y_min)  — reported for completeness
+    Definitions (matching Utonia / cone-detector convention)
+    --------
+    height : Z-axis extent  (z_max − z_min)   ← vertical
+    width  : X-axis extent  (x_max − x_min)   ← horizontal
+    depth  : Y-axis extent  (y_max − y_min)   ← depth
     """
-    col_w = 76
+    col_w = 72
     print("\n" + "═" * col_w)
-    print(f"  SEGMENT DIMENSIONS  ({len(segments)} object(s))")
+    print(f"  SEGMENT DIMENSIONS  ({len(unique_labels)} object(s))")
     print("═" * col_w)
     print(
-        f"{'ID':>4}  {'Color (R,G,B)':>16}  {'Pts':>7}"
-        f"  {'Width(X)':>9}  {'Depth(Y)':>9}  {'Height(Z)':>10}"
+        f"{'ID':>4}  {'Pts':>8}  {'Width(X)':>9}  "
+        f"{'Depth(Y)':>9}  {'Height(Z)':>10}  {'File'}"
     )
     print("─" * col_w)
 
-    for seg_id, (color_key, indices) in enumerate(segments.items()):
-        seg_xyz = xyz[indices]
-        r, g, b = color_key
+    for seg_id, lbl in enumerate(unique_labels):
+        mask    = labels == lbl
+        seg_xyz = xyz[mask]
 
         x_min, x_max = float(seg_xyz[:, 0].min()), float(seg_xyz[:, 0].max())
         y_min, y_max = float(seg_xyz[:, 1].min()), float(seg_xyz[:, 1].max())
         z_min, z_max = float(seg_xyz[:, 2].min()), float(seg_xyz[:, 2].max())
 
-        width  = x_max - x_min   # X-extent → "width"
-        depth  = y_max - y_min   # Y-extent → "depth"
-        height = z_max - z_min   # Z-extent → "height"
+        width  = x_max - x_min
+        depth  = y_max - y_min
+        height = z_max - z_min
 
-        color_str = f"({r:3d},{g:3d},{b:3d})"
         print(
-            f"{seg_id:>4}  {color_str:>16}  {len(indices):>7,}"
-            f"  {width:>9.4f}  {depth:>9.4f}  {height:>10.4f}"
+            f"{seg_id:>4}  {mask.sum():>8,}  {width:>9.4f}  "
+            f"{depth:>9.4f}  {height:>10.4f}  {saved_paths[seg_id].name}"
         )
-        print(f"{'':>4}  {'↳ file':>16}: {saved_paths[seg_id].name}")
 
     print("═" * col_w)
     print("  Units match the coordinate units of the input point cloud.")
@@ -245,38 +326,38 @@ def print_dimensions(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CLI entry point
-# ═════════════════════════════���════════════════════════════════════════════════
+# CLI
+# ══════════════════════════════════════════════════════════════════════════════
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
-            "Export segments from a Utonia / PCA color-segmented point cloud "
-            "and report their height & width.  All points of the same segment "
-            "color are guaranteed to be written into a single .ply file."
+            "Export segments from a Utonia PCA-colored point cloud.\n"
+            "Segments are recovered by clustering the continuous float RGB\n"
+            "values using the same PCA projection strategy as app.py."
         ),
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument(
-        "--input", "-i", required=True,
-        help="Path to the Utonia PCA color-segmented .ply file.",
-    )
-    p.add_argument(
-        "--output_dir", "-o", default=DEFAULT_OUTPUT_DIR,
-        help="Directory where per-segment .ply files will be written.",
-    )
-    p.add_argument(
-        "--tolerance", "-t", type=int, default=DEFAULT_COLOR_TOLERANCE,
-        help=(
-            "RGB rounding tolerance (uint8). "
-            "0 = exact color match; 2-5 absorbs minor float-rounding differences. "
-            "Colors within tolerance/2 on every channel are merged into one segment."
-        ),
-    )
-    p.add_argument(
-        "--min_points", "-m", type=int, default=DEFAULT_MIN_POINTS,
-        help="Minimum number of points for a segment to be kept.",
-    )
+    p.add_argument("--input",  "-i", required=True,
+                   help="Path to the Utonia PCA-colored .ply file.")
+    p.add_argument("--output_dir", "-o", default=DEFAULT_OUTPUT_DIR,
+                   help="Directory for per-segment .ply files.")
+    p.add_argument("--method", "-M", default=DEFAULT_METHOD,
+                   choices=["kmeans", "dbscan"],
+                   help="Clustering method: 'kmeans' (default) or 'dbscan'.")
+
+    # K-Means options
+    p.add_argument("--n_segments", "-k", type=int, default=DEFAULT_N_SEGMENTS,
+                   help="[K-Means] Number of segments K. Auto-estimated if omitted.")
+
+    # DBSCAN options
+    p.add_argument("--eps", "-e", type=float, default=DEFAULT_DBSCAN_EPS,
+                   help="[DBSCAN] Neighborhood radius in PCA-projected RGB space.")
+    p.add_argument("--min_pts", type=int, default=DEFAULT_DBSCAN_MIN_PTS,
+                   help="[DBSCAN] min_samples parameter.")
+
+    p.add_argument("--min_points", "-m", type=int, default=DEFAULT_MIN_POINTS,
+                   help="Minimum points for a segment to be kept (others = noise).")
     return p
 
 
@@ -290,17 +371,27 @@ def main() -> None:
     # 1. Load
     xyz, colors = load_pointcloud(input_path)
 
-    # 2. Group by segment color — all similar colors → one group → one file
-    segments = group_by_color(colors, args.tolerance, args.min_points)
+    # 2. Cluster PCA colors using the same projection strategy as app.py
+    if args.method == "kmeans":
+        labels = segment_by_kmeans(colors, args.n_segments, args.min_points)
+    else:
+        labels = segment_by_dbscan(colors, args.eps, args.min_pts, args.min_points)
 
-    if not segments:
-        sys.exit("No valid segments found.  Try lowering --min_points or --tolerance.")
+    n_valid = len(np.unique(labels[labels != -1]))
+    if n_valid == 0:
+        sys.exit(
+            "No valid segments found.\n"
+            "  • K-Means: try a different --n_segments value.\n"
+            "  • DBSCAN:  try a smaller --eps or --min_pts value."
+        )
 
-    # 3. Save — one .ply per segment color
-    saved_paths = save_segments(xyz, colors, segments, Path(args.output_dir))
+    # 3. Save — one .ply per segment
+    saved_paths, unique_labels, labels = save_segments(
+        xyz, colors, labels, Path(args.output_dir)
+    )
 
     # 4. Print height / width table
-    print_dimensions(xyz, segments, saved_paths)
+    print_dimensions(xyz, labels, unique_labels, saved_paths)
 
 
 if __name__ == "__main__":
