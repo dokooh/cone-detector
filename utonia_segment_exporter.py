@@ -3,8 +3,8 @@ utonia_segment_exporter.py
 ==========================
 Reads a color-segmented point cloud produced by Utonia's PCA pipeline
 (.ply with per-point RGB), groups points by their unique segment color,
-writes each segment to its own .ply file, and prints the height/width
-of every segmented object.
+writes ONE .ply file per segment color (all similar-colored points merged),
+and prints the height/width of every segmented object.
 
 Usage
 -----
@@ -36,7 +36,7 @@ except ImportError:
 # ══════════════════════════════════════════════════════════════════════════════
 
 DEFAULT_OUTPUT_DIR = "segments_out"
-DEFAULT_COLOR_TOLERANCE = 2   # uint8 bucket size (0 = exact match)
+DEFAULT_COLOR_TOLERANCE = 2   # uint8 rounding bucket size (0 = exact match)
 DEFAULT_MIN_POINTS = 5        # segments smaller than this are discarded
 
 
@@ -61,8 +61,8 @@ def load_pointcloud(path: Path) -> tuple[np.ndarray, np.ndarray]:
             "Please supply the Utonia / PCA color-segmented output (.ply with RGB)."
         )
 
-    xyz = np.asarray(pcd.points)    # (N, 3)
-    colors = np.asarray(pcd.colors) # (N, 3)  float64 in [0, 1]
+    xyz    = np.asarray(pcd.points)    # (N, 3) float64
+    colors = np.asarray(pcd.colors)    # (N, 3) float64 in [0, 1]
 
     print(f"Loaded  : {path.name}")
     print(f"Points  : {len(xyz):,}")
@@ -75,50 +75,88 @@ def load_pointcloud(path: Path) -> tuple[np.ndarray, np.ndarray]:
     return xyz, colors
 
 
+def _quantise_colors(colors: np.ndarray, tolerance: int) -> np.ndarray:
+    """
+    Convert float [0, 1] RGB to uint8 and snap each channel to the nearest
+    multiple of `tolerance`.
+
+    Using *round* (not floor-divide) ensures that two values that differ by
+    less than tolerance/2 on every channel map to the same representative
+    and are therefore merged into a single segment — regardless of which
+    side of a bucket boundary they happen to sit on.
+
+    Parameters
+    ----------
+    colors    : (N, 3) float64 in [0, 1]
+    tolerance : rounding granularity in uint8 space; 0 means exact match
+
+    Returns
+    -------
+    (N, 3) uint8 — quantised color key for each point
+    """
+    colors_u8 = (colors * 255.0).round().astype(np.int16)   # int16 avoids overflow
+
+    if tolerance > 1:
+        # Round to nearest multiple of tolerance (not floor-divide).
+        # e.g. tolerance=4: 253→252, 254→252, 255→256→clipped to 255
+        colors_q = (np.round(colors_u8 / tolerance) * tolerance).astype(np.int16)
+        colors_q = np.clip(colors_q, 0, 255).astype(np.uint8)
+    elif tolerance == 1:
+        colors_q = colors_u8.clip(0, 255).astype(np.uint8)
+    else:
+        # tolerance == 0 → exact match
+        colors_q = colors_u8.clip(0, 255).astype(np.uint8)
+
+    return colors_q
+
+
 def group_by_color(
     colors: np.ndarray,
     tolerance: int = DEFAULT_COLOR_TOLERANCE,
     min_points: int = DEFAULT_MIN_POINTS,
 ) -> dict[tuple[int, int, int], np.ndarray]:
     """
-    Group point indices by their quantised RGB color.
+    Group point indices by their quantised RGB color so that ALL points
+    belonging to the same Utonia segment end up in exactly one group.
 
     Utonia assigns a unique flat RGB to each PCA segment, so every group
     of identically-colored points corresponds to one segment.
 
     Parameters
     ----------
-    colors    : (N, 3) float64 in [0, 1]
-    tolerance : bucket size in uint8 space (0 = exact match, 2-5 = tolerant)
-    min_points: groups smaller than this are discarded as noise
+    colors     : (N, 3) float64 in [0, 1]
+    tolerance  : rounding granularity in uint8 space (0 = exact match,
+                 2-5 = tolerant, absorbs floating-point rounding)
+    min_points : groups smaller than this are discarded as noise
 
     Returns
     -------
     dict mapping (R, G, B) uint8 tuple → array of point indices
     """
-    # float [0, 1] → uint8 [0, 255]
-    colors_u8 = (colors * 255.0).round().astype(np.uint8)
+    colors_q = _quantise_colors(colors, tolerance)   # (N, 3) uint8
 
-    if tolerance > 0:
-        colors_q = (colors_u8 // tolerance) * tolerance
-    else:
-        colors_q = colors_u8
+    # One pass: accumulate indices per quantised color key.
+    # Using a dict with tuple keys is the most reliable way to guarantee
+    # that every point with the same quantised color lands in the same bucket.
+    groups: dict[tuple[int, int, int], list[int]] = defaultdict(list)
+    for idx in range(len(colors_q)):
+        r, g, b = int(colors_q[idx, 0]), int(colors_q[idx, 1]), int(colors_q[idx, 2])
+        groups[(r, g, b)].append(idx)
 
-    groups: dict[tuple, list[int]] = defaultdict(list)
-    for idx, (r, g, b) in enumerate(colors_q):
-        groups[(int(r), int(g), int(b))].append(idx)
-
-    segments = {
-        color: np.array(indices)
+    # Filter noise groups and convert index lists to numpy arrays
+    segments: dict[tuple[int, int, int], np.ndarray] = {
+        color: np.array(indices, dtype=np.int64)
         for color, indices in groups.items()
         if len(indices) >= min_points
     }
 
-    n_total = len(groups)
-    n_valid = len(segments)
-    print(f"\nUnique color groups        : {n_total}")
-    print(f"Valid segments (≥{min_points} pts) : {n_valid}")
-    print(f"Dropped (too small)        : {n_total - n_valid}")
+    n_total   = len(groups)
+    n_valid   = len(segments)
+    n_dropped = n_total - n_valid
+
+    print(f"\nUnique color groups          : {n_total}")
+    print(f"Valid segments (≥{min_points} pts)   : {n_valid}")
+    print(f"Dropped (too small)          : {n_dropped}")
 
     return segments
 
@@ -130,7 +168,10 @@ def save_segments(
     output_dir: Path,
 ) -> list[Path]:
     """
-    Write each segment as an individual .ply file.
+    Write ONE .ply file per segment color.
+
+    All points that share the same quantised RGB (i.e. the same Utonia
+    segment label) are written together into a single file.
 
     File naming convention:
         segment_<id>_rgb<R>-<G>-<B>.ply
@@ -139,15 +180,15 @@ def save_segments(
     saved: list[Path] = []
 
     for seg_id, (color_key, indices) in enumerate(segments.items()):
-        seg_xyz = xyz[indices]
-        seg_colors = colors[indices]  # float [0, 1] — Open3D expects this
+        seg_xyz    = xyz[indices]
+        seg_colors = colors[indices]   # float [0, 1] — Open3D expects this
 
         seg_pcd = o3d.geometry.PointCloud()
         seg_pcd.points = o3d.utility.Vector3dVector(seg_xyz)
         seg_pcd.colors = o3d.utility.Vector3dVector(seg_colors)
 
-        r, g, b = color_key
-        out_file = output_dir / f"segment_{seg_id:04d}_rgb{r:03d}-{g:03d}-{b:03d}.ply"
+        r, g, b   = color_key
+        out_file  = output_dir / f"segment_{seg_id:04d}_rgb{r:03d}-{g:03d}-{b:03d}.ply"
         o3d.io.write_point_cloud(str(out_file), seg_pcd)
         saved.append(out_file)
 
@@ -161,7 +202,7 @@ def print_dimensions(
     saved_paths: list[Path],
 ) -> None:
     """
-    Print the bounding-box dimensions of every segment.
+    Print the axis-aligned bounding-box dimensions of every segment.
 
     Definitions
     -----------
@@ -169,7 +210,7 @@ def print_dimensions(
     width  : X-axis extent  (x_max − x_min)
     depth  : Y-axis extent  (y_max − y_min)  — reported for completeness
     """
-    col_w = 72
+    col_w = 76
     print("\n" + "═" * col_w)
     print(f"  SEGMENT DIMENSIONS  ({len(segments)} object(s))")
     print("═" * col_w)
@@ -187,18 +228,16 @@ def print_dimensions(
         y_min, y_max = float(seg_xyz[:, 1].min()), float(seg_xyz[:, 1].max())
         z_min, z_max = float(seg_xyz[:, 2].min()), float(seg_xyz[:, 2].max())
 
-        width  = x_max - x_min   # X-extent  → "width"
-        depth  = y_max - y_min   # Y-extent  → "depth"
-        height = z_max - z_min   # Z-extent  → "height"
+        width  = x_max - x_min   # X-extent → "width"
+        depth  = y_max - y_min   # Y-extent → "depth"
+        height = z_max - z_min   # Z-extent → "height"
 
         color_str = f"({r:3d},{g:3d},{b:3d})"
         print(
             f"{seg_id:>4}  {color_str:>16}  {len(indices):>7,}"
             f"  {width:>9.4f}  {depth:>9.4f}  {height:>10.4f}"
         )
-        print(
-            f"{'':>4}  {'↳ file':>16}: {saved_paths[seg_id].name}"
-        )
+        print(f"{'':>4}  {'↳ file':>16}: {saved_paths[seg_id].name}")
 
     print("═" * col_w)
     print("  Units match the coordinate units of the input point cloud.")
@@ -207,13 +246,14 @@ def print_dimensions(
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CLI entry point
-# ══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════���════════════════════════════════════════════════
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
             "Export segments from a Utonia / PCA color-segmented point cloud "
-            "and report their height & width."
+            "and report their height & width.  All points of the same segment "
+            "color are guaranteed to be written into a single .ply file."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -228,8 +268,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--tolerance", "-t", type=int, default=DEFAULT_COLOR_TOLERANCE,
         help=(
-            "RGB quantisation tolerance (uint8). "
-            "0 = exact color match; 2-5 handles minor float-rounding differences."
+            "RGB rounding tolerance (uint8). "
+            "0 = exact color match; 2-5 absorbs minor float-rounding differences. "
+            "Colors within tolerance/2 on every channel are merged into one segment."
         ),
     )
     p.add_argument(
@@ -249,13 +290,13 @@ def main() -> None:
     # 1. Load
     xyz, colors = load_pointcloud(input_path)
 
-    # 2. Group by segment color
+    # 2. Group by segment color — all similar colors → one group → one file
     segments = group_by_color(colors, args.tolerance, args.min_points)
 
     if not segments:
         sys.exit("No valid segments found.  Try lowering --min_points or --tolerance.")
 
-    # 3. Save each segment as .ply
+    # 3. Save — one .ply per segment color
     saved_paths = save_segments(xyz, colors, segments, Path(args.output_dir))
 
     # 4. Print height / width table
