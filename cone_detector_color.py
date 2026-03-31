@@ -7,9 +7,9 @@ construction dig site. Pipeline:
   1. Load point cloud (supports .pcd, .ply, .las/.laz, .xyz)
   2. Estimate and remove the ground plane (RANSAC)
   3. Keep only above-ground points
-  4. Filter by orange / white colour
+  4. Filter by orange & white colour at the same time
   5. Cluster the remaining points (DBSCAN)
-  6. Apply a bounding-box size threshold (max 0.8 m in any direction)
+  6. Apply a bounding-box height threshold (max 0.8 m in Z direction only)
   7. Report detected cones and (optionally) save/visualise results
 
 Dependencies:
@@ -49,9 +49,8 @@ WHITE_MAX_SATURATION       = 0.20   # Max (max-min) of RGB channels
 DBSCAN_EPS           = 0.10   # Neighbourhood radius (m)
 DBSCAN_MIN_POINTS    = 15     # Min points to form a cluster
 
-# Size filter
-MAX_CONE_DIMENSION   = 0.80   # Maximum extent in any direction (m)
-MIN_CONE_DIMENSION   = 0.05   # Minimum extent in any direction (m)
+# Size filter – height (Z) only
+MAX_CONE_HEIGHT      = 0.80   # Maximum height extent (m)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -139,7 +138,8 @@ def remove_ground(pcd: o3d.geometry.PointCloud):
 
 def filter_by_colour(pcd: o3d.geometry.PointCloud) -> o3d.geometry.PointCloud:
     """
-    Return a point cloud containing only orange or white points.
+    Return a point cloud containing only orange or white points,
+    evaluated simultaneously in a single combined mask.
     If the cloud has no colour data, all points are returned with a warning.
     """
     if not pcd.has_colors():
@@ -149,19 +149,19 @@ def filter_by_colour(pcd: o3d.geometry.PointCloud) -> o3d.geometry.PointCloud:
     colours = np.asarray(pcd.colors)   # shape (N, 3), values in [0, 1]
     r, g, b = colours[:, 0], colours[:, 1], colours[:, 2]
 
-    # ── Orange mask ──────────────────────────────────────────────────────────
+    # ── Orange & White masks built simultaneously ─���──────────────────────────
     orange_mask = (
         (r >= ORANGE_R_MIN) & (r <= ORANGE_R_MAX) &
         (g >= ORANGE_G_MIN) & (g <= ORANGE_G_MAX) &
         (b >= ORANGE_B_MIN) & (b <= ORANGE_B_MAX)
     )
 
-    # ── White mask ───────────────────────────────────────────────────────────
-    brightness    = (r + g + b) / 3.0
-    saturation    = np.max(colours, axis=1) - np.min(colours, axis=1)
-    white_mask    = (brightness >= WHITE_MIN_BRIGHTNESS) & (saturation <= WHITE_MAX_SATURATION)
+    brightness  = (r + g + b) / 3.0
+    saturation  = np.max(colours, axis=1) - np.min(colours, axis=1)
+    white_mask  = (brightness >= WHITE_MIN_BRIGHTNESS) & (saturation <= WHITE_MAX_SATURATION)
 
-    combined_mask = orange_mask | white_mask
+    # Combine both colour classes at the same time
+    combined_mask   = orange_mask | white_mask
     cone_colour_idx = np.where(combined_mask)[0]
 
     print(f"[colour] Orange points : {orange_mask.sum():,}")
@@ -173,8 +173,9 @@ def filter_by_colour(pcd: o3d.geometry.PointCloud) -> o3d.geometry.PointCloud:
 
 def cluster_and_filter(pcd: o3d.geometry.PointCloud):
     """
-    DBSCAN cluster the filtered point cloud, then apply bounding-box
-    size constraints.  Returns a list of (cluster_pcd, bbox) tuples.
+    DBSCAN cluster the filtered point cloud, then apply a height (Z-axis)
+    bounding-box constraint only (max MAX_CONE_HEIGHT metres).
+    Returns a list of (cluster_pcd, bbox) tuples.
     """
     if len(pcd.points) == 0:
         print("[cluster] No coloured points to cluster.")
@@ -198,18 +199,14 @@ def cluster_and_filter(pcd: o3d.geometry.PointCloud):
         idx     = np.where(labels == lbl)[0]
         cluster = pcd.select_by_index(idx)
         bbox    = cluster.get_axis_aligned_bounding_box()
-        extent  = bbox.get_extent()            # (dx, dy, dz)
+        extent  = bbox.get_extent()   # (dx, dy, dz)
 
-        max_ext = float(np.max(extent))
-        min_ext = float(np.min(extent))
+        # ── Height filter: Z extent (index 2) must be ≤ MAX_CONE_HEIGHT ──────
+        height = float(extent[2])
 
-        if max_ext > MAX_CONE_DIMENSION:
-            print(f"[filter]  Cluster {lbl:3d} REJECTED – too large   "
-                  f"({max_ext:.3f} m > {MAX_CONE_DIMENSION} m)")
-            continue
-        if min_ext < MIN_CONE_DIMENSION:
-            print(f"[filter]  Cluster {lbl:3d} REJECTED – too small   "
-                  f"({min_ext:.3f} m < {MIN_CONE_DIMENSION} m)")
+        if height > MAX_CONE_HEIGHT:
+            print(f"[filter]  Cluster {lbl:3d} REJECTED – too tall   "
+                  f"({height:.3f} m > {MAX_CONE_HEIGHT} m)")
             continue
 
         print(f"[filter]  Cluster {lbl:3d} ACCEPTED – extent "
@@ -217,7 +214,7 @@ def cluster_and_filter(pcd: o3d.geometry.PointCloud):
               f"({len(cluster.points):,} pts)")
         cones.append((cluster, bbox))
 
-    print(f"\n[result] Detected {len(cones)} cone(s) after size filtering.")
+    print(f"\n[result] Detected {len(cones)} cone(s) after height filtering.")
     return cones
 
 
@@ -259,7 +256,7 @@ def visualise(original_pcd, cones, ground_model):
 
 # ──────────────────────────────────────────────────────────────────────────────
 # MAIN
-# ─────────────────────���────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -274,10 +271,8 @@ def parse_args():
         help="Skip saving detected cone clusters")
     parser.add_argument("--visualise", action="store_true",
         help="Open an interactive 3-D viewer after processing")
-    parser.add_argument("--max-size", type=float, default=MAX_CONE_DIMENSION,
-        help="Maximum bounding-box extent in any direction (m)")
-    parser.add_argument("--min-size", type=float, default=MIN_CONE_DIMENSION,
-        help="Minimum bounding-box extent in any direction (m)")
+    parser.add_argument("--max-height", type=float, default=MAX_CONE_HEIGHT,
+        help="Maximum bounding-box height extent in Z direction (m)")
     parser.add_argument("--ground-threshold", type=float,
         default=GROUND_DISTANCE_THRESHOLD,
         help="RANSAC distance threshold for ground plane (m)")
@@ -295,11 +290,10 @@ def main():
     args = parse_args()
 
     # Allow CLI overrides of module-level constants
-    global MAX_CONE_DIMENSION, MIN_CONE_DIMENSION
+    global MAX_CONE_HEIGHT
     global GROUND_DISTANCE_THRESHOLD, ABOVE_GROUND_MARGIN
     global DBSCAN_EPS, DBSCAN_MIN_POINTS
-    MAX_CONE_DIMENSION        = args.max_size
-    MIN_CONE_DIMENSION        = args.min_size
+    MAX_CONE_HEIGHT           = args.max_height
     GROUND_DISTANCE_THRESHOLD = args.ground_threshold
     ABOVE_GROUND_MARGIN       = args.above_margin
     DBSCAN_EPS                = args.eps
@@ -315,10 +309,10 @@ def main():
     # 2. Ground removal
     above_pcd, ground_model = remove_ground(pcd)
 
-    # 3. Colour filter (orange + white)
+    # 3. Colour filter (orange + white simultaneously)
     colour_pcd = filter_by_colour(above_pcd)
 
-    # 4. Cluster + size filter
+    # 4. Cluster + height filter
     cones = cluster_and_filter(colour_pcd)
 
     # 5. Save
