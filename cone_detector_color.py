@@ -7,14 +7,13 @@ construction dig site. Pipeline:
   1. Load point cloud (supports .pcd, .ply, .las/.laz, .xyz)
   2. Estimate and remove the ground plane (RANSAC)
   3. Keep only above-ground points
-  4. Filter by orange / white colour separately
-  5. Merge orange+white clusters that are spatially close (proximity check)
+  4. Filter by orange / white colour
+  5. Cluster the remaining points (DBSCAN)
   6. Apply a bounding-box size threshold (max 0.8 m in any direction)
-  7. Save all accepted cones as ONE combined .ply file
+  7. Report detected cones and (optionally) save/visualise results
 
 Dependencies:
-    pip install open3d numpy
-    pip install "laspy[lazrs]"   # only needed for .las/.laz input
+    pip install open3d numpy scipy laspy lazrs-python
 """
 
 import argparse
@@ -47,21 +46,17 @@ WHITE_MIN_BRIGHTNESS       = 0.70   # All channels ≥ this value
 WHITE_MAX_SATURATION       = 0.20   # Max (max-min) of RGB channels
 
 # DBSCAN clustering
-DBSCAN_EPS        = 0.10   # Neighbourhood radius (m)
-DBSCAN_MIN_POINTS = 15     # Min points to form a cluster
+DBSCAN_EPS           = 0.10   # Neighbourhood radius (m)
+DBSCAN_MIN_POINTS    = 15     # Min points to form a cluster
 
 # Size filter
-MAX_CONE_DIMENSION = 0.80   # Maximum extent in any direction (m)
-MIN_CONE_DIMENSION = 0.05   # Minimum extent in any direction (m)
-
-# Proximity merge
-MERGE_DISTANCE_THRESHOLD = 0.30   # Max centroid-to-centroid distance (m)
-                                   # to merge an orange+white cluster pair
+MAX_CONE_DIMENSION   = 0.80   # Maximum extent in any direction (m)
+MIN_CONE_DIMENSION   = 0.05   # Minimum extent in any direction (m)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # HELPERS
-# ──────────────────────────────────────────────────────────────────────��───────
+# ──────────────────────────────────────────────────────────────────────────────
 
 def load_point_cloud(path: str) -> o3d.geometry.PointCloud:
     """Load a point cloud from various formats, normalising colours to [0, 1]."""
@@ -74,12 +69,15 @@ def load_point_cloud(path: str) -> o3d.geometry.PointCloud:
         try:
             import laspy
         except ImportError:
-            sys.exit("laspy is required for .las/.laz files.\n"
-                     "Install with:  pip install \"laspy[lazrs]\"")
+            sys.exit("laspy is required for .las/.laz files.  pip install laspy lazrs-python")
+
         las = laspy.read(path)
         xyz = np.vstack((las.x, las.y, las.z)).T
+
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(xyz)
+
+        # LAS stores colour as uint16 (0-65535)
         if hasattr(las, "red") and hasattr(las, "green") and hasattr(las, "blue"):
             r = np.asarray(las.red,   dtype=np.float64) / 65535.0
             g = np.asarray(las.green, dtype=np.float64) / 65535.0
@@ -92,25 +90,26 @@ def load_point_cloud(path: str) -> o3d.geometry.PointCloud:
         pcd.points = o3d.utility.Vector3dVector(data[:, :3])
         if data.shape[1] >= 6:
             colours = data[:, 3:6]
+            # Auto-detect uint8 range
             if colours.max() > 1.0:
                 colours = colours / 255.0
             pcd.colors = o3d.utility.Vector3dVector(colours)
 
     else:
         sys.exit(f"Unsupported file format: '{ext}'.  "
-                 f"Supported: .pcd  .ply  .las  .laz  .xyz")
+                 f"Supported: .pcd .ply .las .laz .xyz")
 
     if not pcd.has_points():
         sys.exit(f"No points loaded from '{path}'.")
 
-    print(f"[load]    Loaded {len(pcd.points):,} points from '{path}'")
+    print(f"[load]   Loaded {len(pcd.points):,} points from '{path}'")
     return pcd
 
 
 def remove_ground(pcd: o3d.geometry.PointCloud):
     """
-    Estimate the dominant ground plane with RANSAC.
-    Returns the above-ground point cloud and the plane model [a,b,c,d].
+    Estimate the dominant ground plane with RANSAC, return the
+    above-ground point cloud and the plane equation [a, b, c, d].
     """
     plane_model, inliers = pcd.segment_plane(
         distance_threshold = GROUND_DISTANCE_THRESHOLD,
@@ -118,269 +117,217 @@ def remove_ground(pcd: o3d.geometry.PointCloud):
         num_iterations     = GROUND_RANSAC_ITER,
     )
     a, b, c, d = plane_model
-    print(f"[ground]  Plane: {a:.4f}x + {b:.4f}y + {c:.4f}z + {d:.4f} = 0  "
+    print(f"[ground] Plane equation: {a:.4f}x + {b:.4f}y + {c:.4f}z + {d:.4f} = 0  "
           f"({len(inliers):,} inliers)")
 
-    pts  = np.asarray(pcd.points)
+    # Compute signed distances from the plane; keep points above it
+    pts = np.asarray(pcd.points)
     norm = np.sqrt(a**2 + b**2 + c**2)
     signed_dist = (a * pts[:, 0] + b * pts[:, 1] + c * pts[:, 2] + d) / norm
 
-    # Ensure positive == above ground
+    # Ensure the normal points upward (positive = above ground)
     if c < 0:
         signed_dist = -signed_dist
 
-    above_idx = np.where(signed_dist > ABOVE_GROUND_MARGIN)[0]
+    above_mask = signed_dist > ABOVE_GROUND_MARGIN
+    above_idx  = np.where(above_mask)[0]
+
     above_pcd = pcd.select_by_index(above_idx)
-    print(f"[ground]  Above-ground points: {len(above_pcd.points):,}")
+    print(f"[ground] Above-ground points: {len(above_pcd.points):,}")
     return above_pcd, plane_model
 
 
-def _colour_masks(pcd: o3d.geometry.PointCloud):
+def filter_by_colour(pcd: o3d.geometry.PointCloud) -> o3d.geometry.PointCloud:
     """
-    Return (orange_mask, white_mask) boolean arrays over pcd points.
-    If the cloud has no colours both masks are all-True (no filtering).
+    Return a point cloud containing only orange or white points.
+    If the cloud has no colour data, all points are returned with a warning.
     """
     if not pcd.has_colors():
-        n = len(pcd.points)
-        print("[colour]  WARNING: no colour data – treating all points as candidates.")
-        return np.ones(n, dtype=bool), np.ones(n, dtype=bool)
+        print("[colour] WARNING: no colour data – skipping colour filter.")
+        return pcd
 
-    colours = np.asarray(pcd.colors)          # (N, 3) in [0, 1]
+    colours = np.asarray(pcd.colors)   # shape (N, 3), values in [0, 1]
     r, g, b = colours[:, 0], colours[:, 1], colours[:, 2]
 
+    # ── Orange mask ──────────────────────────────────────────────────────────
     orange_mask = (
         (r >= ORANGE_R_MIN) & (r <= ORANGE_R_MAX) &
         (g >= ORANGE_G_MIN) & (g <= ORANGE_G_MAX) &
         (b >= ORANGE_B_MIN) & (b <= ORANGE_B_MAX)
     )
 
-    brightness   = (r + g + b) / 3.0
-    saturation   = np.max(colours, axis=1) - np.min(colours, axis=1)
-    white_mask   = (brightness >= WHITE_MIN_BRIGHTNESS) & (saturation <= WHITE_MAX_SATURATION)
+    # ── White mask ───────────────────────────────────────────────────────────
+    brightness    = (r + g + b) / 3.0
+    saturation    = np.max(colours, axis=1) - np.min(colours, axis=1)
+    white_mask    = (brightness >= WHITE_MIN_BRIGHTNESS) & (saturation <= WHITE_MAX_SATURATION)
 
-    print(f"[colour]  Orange points : {orange_mask.sum():,}")
-    print(f"[colour]  White  points : {white_mask.sum():,}")
-    return orange_mask, white_mask
+    combined_mask = orange_mask | white_mask
+    cone_colour_idx = np.where(combined_mask)[0]
+
+    print(f"[colour] Orange points : {orange_mask.sum():,}")
+    print(f"[colour] White  points : {white_mask.sum():,}")
+    print(f"[colour] Combined      : {len(cone_colour_idx):,}")
+
+    return pcd.select_by_index(cone_colour_idx)
 
 
-def _dbscan_clusters(pcd: o3d.geometry.PointCloud) -> list:
+def cluster_and_filter(pcd: o3d.geometry.PointCloud):
     """
-    Run DBSCAN on pcd and return a list of open3d.geometry.PointCloud objects,
-    one per cluster (noise label -1 is discarded).
+    DBSCAN cluster the filtered point cloud, then apply bounding-box
+    size constraints.  Returns a list of (cluster_pcd, bbox) tuples.
     """
     if len(pcd.points) == 0:
+        print("[cluster] No coloured points to cluster.")
         return []
 
     labels = np.array(
         pcd.cluster_dbscan(
-            eps            = DBSCAN_EPS,
-            min_points     = DBSCAN_MIN_POINTS,
+            eps        = DBSCAN_EPS,
+            min_points = DBSCAN_MIN_POINTS,
             print_progress = False,
         )
     )
-    clusters = []
-    for lbl in range(labels.max() + 1):
-        idx = np.where(labels == lbl)[0]
-        clusters.append(pcd.select_by_index(idx))
-    return clusters
 
+    max_label = labels.max() if labels.size > 0 else -1
+    n_clusters = max_label + 1
+    print(f"[cluster] DBSCAN found {n_clusters} cluster(s)  "
+          f"(noise points: {(labels == -1).sum():,})")
 
-def _centroid(pcd: o3d.geometry.PointCloud) -> np.ndarray:
-    return np.asarray(pcd.points).mean(axis=0)
+    cones = []
+    for lbl in range(n_clusters):
+        idx     = np.where(labels == lbl)[0]
+        cluster = pcd.select_by_index(idx)
+        bbox    = cluster.get_axis_aligned_bounding_box()
+        extent  = bbox.get_extent()            # (dx, dy, dz)
 
-
-def detect_and_merge(above_pcd: o3d.geometry.PointCloud) -> list:
-    """
-    Core detection logic:
-      1. Split above-ground cloud into orange / white sub-clouds.
-      2. DBSCAN-cluster each colour independently.
-      3. For every orange cluster, check if any white cluster centroid
-         is within MERGE_DISTANCE_THRESHOLD → merge them (cone body + stripe).
-      4. Unmatched orange clusters (no nearby white) are kept as-is.
-      5. White clusters that were NOT merged are silently discarded
-         (reflective ground markings, helmets, etc.).
-      6. Apply bounding-box size filter.
-    Returns a list of accepted cone PointClouds.
-    """
-    orange_mask, white_mask = _colour_masks(above_pcd)
-
-    orange_pcd = above_pcd.select_by_index(np.where(orange_mask)[0])
-    white_pcd  = above_pcd.select_by_index(np.where(white_mask)[0])
-
-    orange_clusters = _dbscan_clusters(orange_pcd)
-    white_clusters  = _dbscan_clusters(white_pcd)
-
-    print(f"[cluster] Orange clusters: {len(orange_clusters)}  |  "
-          f"White clusters: {len(white_clusters)}")
-
-    # Pre-compute white centroids
-    white_centroids = [_centroid(wc) for wc in white_clusters]
-    white_used      = [False] * len(white_clusters)
-
-    merged_candidates = []
-
-    for oc in orange_clusters:
-        oc_centroid = _centroid(oc)
-        nearby_white = []
-
-        for wi, wc in enumerate(white_clusters):
-            dist = float(np.linalg.norm(oc_centroid - white_centroids[wi]))
-            if dist <= MERGE_DISTANCE_THRESHOLD:
-                nearby_white.append(wi)
-                white_used[wi] = True
-
-        if nearby_white:
-            # Merge orange + all nearby white clusters
-            parts = [oc] + [white_clusters[wi] for wi in nearby_white]
-            merged = _combine(parts)
-            print(f"[merge]   Orange cluster merged with "
-                  f"{len(nearby_white)} white cluster(s)  "
-                  f"→ {len(merged.points):,} pts")
-        else:
-            merged = oc
-            print(f"[merge]   Orange cluster kept solo  "
-                  f"({len(merged.points):,} pts, no nearby white)")
-
-        merged_candidates.append(merged)
-
-    # ── Size filter ───────────────────────────────────────────────────────────
-    accepted = []
-    for i, candidate in enumerate(merged_candidates):
-        bbox   = candidate.get_axis_aligned_bounding_box()
-        extent = bbox.get_extent()
         max_ext = float(np.max(extent))
         min_ext = float(np.min(extent))
 
         if max_ext > MAX_CONE_DIMENSION:
-            print(f"[filter]  Candidate {i:3d} REJECTED – too large  "
+            print(f"[filter]  Cluster {lbl:3d} REJECTED – too large   "
                   f"({max_ext:.3f} m > {MAX_CONE_DIMENSION} m)")
             continue
         if min_ext < MIN_CONE_DIMENSION:
-            print(f"[filter]  Candidate {i:3d} REJECTED – too small  "
+            print(f"[filter]  Cluster {lbl:3d} REJECTED – too small   "
                   f"({min_ext:.3f} m < {MIN_CONE_DIMENSION} m)")
             continue
 
-        print(f"[filter]  Candidate {i:3d} ACCEPTED – "
+        print(f"[filter]  Cluster {lbl:3d} ACCEPTED – extent "
               f"{extent[0]:.3f} x {extent[1]:.3f} x {extent[2]:.3f} m  "
-              f"({len(candidate.points):,} pts)")
-        accepted.append(candidate)
+              f"({len(cluster.points):,} pts)")
+        cones.append((cluster, bbox))
 
-    unmerged_white = sum(1 for u in white_used if not u)
-    if unmerged_white:
-        print(f"[merge]   {unmerged_white} white cluster(s) had no nearby orange – discarded.")
-
-    print(f"\n[result]  {len(accepted)} cone(s) accepted after size filtering.")
-    return accepted
+    print(f"\n[result] Detected {len(cones)} cone(s) after size filtering.")
+    return cones
 
 
-def _combine(pcds: list) -> o3d.geometry.PointCloud:
-    """Concatenate a list of PointClouds into one."""
-    all_pts  = np.vstack([np.asarray(p.points)  for p in pcds])
-    combined = o3d.geometry.PointCloud()
-    combined.points = o3d.utility.Vector3dVector(all_pts)
-
-    if all(p.has_colors() for p in pcds):
-        all_col = np.vstack([np.asarray(p.colors) for p in pcds])
-        combined.colors = o3d.utility.Vector3dVector(all_col)
-
-    return combined
+def save_results(cones, output_dir: str):
+    """Save each detected cone cluster as an individual .ply file."""
+    os.makedirs(output_dir, exist_ok=True)
+    for i, (cluster, _) in enumerate(cones):
+        out_path = os.path.join(output_dir, f"cone_{i:03d}.ply")
+        o3d.io.write_point_cloud(out_path, cluster)
+        print(f"[save]   Saved cone {i:03d}  →  {out_path}")
 
 
-def save_combined(cones: list, output_path: str):
-    """Merge ALL accepted cone clusters into one .ply file and save it."""
-    if not cones:
-        print("[save]    No cones to save.")
-        return
-
-    combined = _combine(cones)
-    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    o3d.io.write_point_cloud(output_path, combined)
-    print(f"[save]    {len(cones)} cone(s) → {len(combined.points):,} pts  "
-          f"saved to '{output_path}'")
-
-
-def visualise(original_pcd, cones):
-    """Interactive 3-D viewer: grey scene + orange cones with red bounding boxes."""
+def visualise(original_pcd, cones, ground_model):
+    """Visualise the full cloud plus colour-coded detected cones."""
     vis_objects = []
 
-    scene = o3d.geometry.PointCloud(original_pcd)
-    scene.paint_uniform_color([0.6, 0.6, 0.6])
-    vis_objects.append(scene)
+    # Original cloud in grey
+    orig_vis = o3d.geometry.PointCloud(original_pcd)
+    orig_vis.paint_uniform_color([0.6, 0.6, 0.6])
+    vis_objects.append(orig_vis)
 
-    for cone in cones:
-        cone_vis = o3d.geometry.PointCloud(cone)
-        cone_vis.paint_uniform_color([1.0, 0.45, 0.0])
+    # Detected cones in bright orange with bounding boxes
+    cone_colour = [1.0, 0.45, 0.0]
+    for cluster, bbox in cones:
+        cone_vis = o3d.geometry.PointCloud(cluster)
+        cone_vis.paint_uniform_color(cone_colour)
         vis_objects.append(cone_vis)
 
-        bbox       = cone.get_axis_aligned_bounding_box()
         bbox.color = (1.0, 0.0, 0.0)
         vis_objects.append(bbox)
 
     o3d.visualization.draw_geometries(
         vis_objects,
         window_name = "Cone Detector – Construction Site",
-        width=1280, height=720,
+        width       = 1280,
+        height      = 720,
     )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CLI
-# ──────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────���────────────────────────────────────────────────────────
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Detect orange/white safety cones in a construction-site point cloud.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description = "Detect orange/white safety cones in a construction-site point cloud.",
+        formatter_class = argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("input",
-        help="Input point cloud (.pcd, .ply, .las, .laz, .xyz)")
-    parser.add_argument("-o", "--output", default="cone_results/cones_detected.ply",
-        help="Output .ply file path (all detected cones merged into one file)")
+        help="Path to input point cloud file (.pcd, .ply, .las, .laz, .xyz)")
+    parser.add_argument("-o", "--output-dir", default="cone_results",
+        help="Directory to save individual cone point clouds")
     parser.add_argument("--no-save",  action="store_true",
-        help="Skip saving the output file")
+        help="Skip saving detected cone clusters")
     parser.add_argument("--visualise", action="store_true",
         help="Open an interactive 3-D viewer after processing")
-
-    # Overridable thresholds
-    parser.add_argument("--max-size",          type=float, default=MAX_CONE_DIMENSION)
-    parser.add_argument("--min-size",          type=float, default=MIN_CONE_DIMENSION)
-    parser.add_argument("--ground-threshold",  type=float, default=GROUND_DISTANCE_THRESHOLD)
-    parser.add_argument("--above-margin",      type=float, default=ABOVE_GROUND_MARGIN)
-    parser.add_argument("--eps",               type=float, default=DBSCAN_EPS)
-    parser.add_argument("--min-points",        type=int,   default=DBSCAN_MIN_POINTS)
-    parser.add_argument("--merge-distance",    type=float, default=MERGE_DISTANCE_THRESHOLD,
-        help="Max centroid distance (m) to merge an orange+white cluster pair")
+    parser.add_argument("--max-size", type=float, default=MAX_CONE_DIMENSION,
+        help="Maximum bounding-box extent in any direction (m)")
+    parser.add_argument("--min-size", type=float, default=MIN_CONE_DIMENSION,
+        help="Minimum bounding-box extent in any direction (m)")
+    parser.add_argument("--ground-threshold", type=float,
+        default=GROUND_DISTANCE_THRESHOLD,
+        help="RANSAC distance threshold for ground plane (m)")
+    parser.add_argument("--above-margin", type=float,
+        default=ABOVE_GROUND_MARGIN,
+        help="Keep points this many metres above ground plane (m)")
+    parser.add_argument("--eps", type=float, default=DBSCAN_EPS,
+        help="DBSCAN neighbourhood radius (m)")
+    parser.add_argument("--min-points", type=int, default=DBSCAN_MIN_POINTS,
+        help="DBSCAN minimum cluster size")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
+    # Allow CLI overrides of module-level constants
     global MAX_CONE_DIMENSION, MIN_CONE_DIMENSION
     global GROUND_DISTANCE_THRESHOLD, ABOVE_GROUND_MARGIN
-    global DBSCAN_EPS, DBSCAN_MIN_POINTS, MERGE_DISTANCE_THRESHOLD
-
+    global DBSCAN_EPS, DBSCAN_MIN_POINTS
     MAX_CONE_DIMENSION        = args.max_size
     MIN_CONE_DIMENSION        = args.min_size
     GROUND_DISTANCE_THRESHOLD = args.ground_threshold
     ABOVE_GROUND_MARGIN       = args.above_margin
     DBSCAN_EPS                = args.eps
     DBSCAN_MIN_POINTS         = args.min_points
-    MERGE_DISTANCE_THRESHOLD  = args.merge_distance
 
     print("=" * 60)
     print("  Cone Detector – Construction Site Point Cloud")
     print("=" * 60)
 
-    pcd       = load_point_cloud(args.input)
-    above_pcd, _ = remove_ground(pcd)
-    cones     = detect_and_merge(above_pcd)
+    # 1. Load
+    pcd = load_point_cloud(args.input)
 
-    if not args.no_save:
-        save_combined(cones, args.output)
+    # 2. Ground removal
+    above_pcd, ground_model = remove_ground(pcd)
 
+    # 3. Colour filter (orange + white)
+    colour_pcd = filter_by_colour(above_pcd)
+
+    # 4. Cluster + size filter
+    cones = cluster_and_filter(colour_pcd)
+
+    # 5. Save
+    if not args.no_save and cones:
+        save_results(cones, args.output_dir)
+
+    # 6. Visualise
     if args.visualise:
-        visualise(pcd, cones)
+        visualise(pcd, cones, ground_model)
 
     print("=" * 60)
     print(f"  Done.  {len(cones)} cone(s) detected.")
