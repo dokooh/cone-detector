@@ -2,25 +2,56 @@
 utonia_segment_exporter.py
 ==========================
 Reads a color-segmented point cloud produced by Utonia's PCA pipeline
-(.ply with per-point RGB), groups points by their unique segment color,
-writes ONE .ply file per segment color (all similar-colored points merged),
-and prints the height/width of every segmented object.
+(.ply with per-point float RGB in [0,1]), recovers segments by grouping
+points that share the same **hue band** in HSV space, writes ONE .ply
+file per gradient-color region, and prints the height / width of every
+segmented object.
+
+Why HSV hue-band clustering?
+-----------------------------
+Utonia's get_pca_color (app.py) produces colors via:
+
+    u, s, v  = torch.pca_lowrank(feat, center=True, q=3*(start+1))
+    proj     = feat @ v                       # (N, 3)  PCA projection
+    proj     = minmax_normalize(proj)         # → float RGB in [0, 1]
+    color    = clamp(proj * brightness, 0, 1)
+
+Points belonging to the same semantic region share similar PCA
+projection values → similar **hue** when viewed in HSV.
+"Pink", "yellow", "cyan" etc. are hue bands — clustering in circular
+hue space is therefore the most faithful way to recover PCA segments.
+
+Clustering pipeline
+-------------------
+1. Convert float RGB [0,1] → HSV.
+2. Build a (cos H, sin H, S, V) feature for circular-safe clustering.
+3. K-Means (default, fast) or DBSCAN (no-K fallback) on that feature.
+4. Optional: merge any two clusters whose mean hue differs < --merge_deg.
+5. Save one .ply per cluster, print AABB dimensions.
 
 Usage
 -----
-    python utonia_segment_exporter.py --input segmented_scene.ply
-    python utonia_segment_exporter.py --input segmented_scene.ply --output_dir my_segments --tolerance 3
+    # Auto-estimate K (elbow method):
+    python utonia_segment_exporter.py --input scene_pca.ply
+
+    # Explicit K:
+    python utonia_segment_exporter.py --input scene_pca.ply --n_segments 8
+
+    # DBSCAN (no K needed):
+    python utonia_segment_exporter.py --input scene_pca.ply --method dbscan --eps 0.12
+
+    # Merge clusters whose hues are within 15 degrees of each other:
+    python utonia_segment_exporter.py --input scene_pca.ply --merge_deg 15
 
 Requirements
 ------------
-    pip install open3d numpy
+    pip install open3d numpy scikit-learn
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
-from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -30,214 +61,404 @@ try:
 except ImportError:
     sys.exit("open3d is not installed.  Run:  pip install open3d")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Configuration defaults
-# ══════════════════════════════════════════════════════════════════════════════
-
-DEFAULT_OUTPUT_DIR = "segments_out"
-DEFAULT_COLOR_TOLERANCE = 2   # uint8 rounding bucket size (0 = exact match)
-DEFAULT_MIN_POINTS = 5        # segments smaller than this are discarded
+try:
+    from sklearn.cluster import KMeans, DBSCAN
+except ImportError:
+    sys.exit("scikit-learn is not installed.  Run:  pip install scikit-learn")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Core logic
+# Defaults
+# ══════════════════════════════════════════════════════════════════════════════
+
+DEFAULT_OUTPUT_DIR     = "segments_out"
+DEFAULT_METHOD         = "kmeans"
+DEFAULT_N_SEGMENTS     = None   # None → auto-estimate via elbow
+DEFAULT_DBSCAN_EPS     = 0.12   # in HSV feature space
+DEFAULT_DBSCAN_MIN_PTS = 50
+DEFAULT_MIN_POINTS     = 10     # clusters smaller than this = noise
+DEFAULT_MERGE_DEG      = 0.0    # 0 = no merging
+
+
+# ══════════════════════���═══════════════════════════════════════════════════════
+# I/O
 # ══════════════════════════════════════════════════════════════════════════════
 
 def load_pointcloud(path: Path) -> tuple[np.ndarray, np.ndarray]:
     """
-    Load a .ply file and return (xyz, colors).
-
-    xyz    : (N, 3) float64  — XYZ coordinates
-    colors : (N, 3) float64  — RGB in [0, 1] as stored by Open3D
+    Load a .ply and return:
+      xyz    : (N, 3) float64 — XYZ coordinates
+      colors : (N, 3) float64 — float RGB in [0, 1]  (Utonia PCA colors)
     """
     pcd = o3d.io.read_point_cloud(str(path))
-
     if len(pcd.points) == 0:
         sys.exit(f"ERROR: Point cloud is empty: {path}")
     if not pcd.has_colors():
         sys.exit(
             "ERROR: The point cloud has no color information.\n"
-            "Please supply the Utonia / PCA color-segmented output (.ply with RGB)."
+            "Please supply the Utonia PCA-colored output (.ply with float RGB)."
         )
 
-    xyz    = np.asarray(pcd.points)    # (N, 3) float64
-    colors = np.asarray(pcd.colors)    # (N, 3) float64 in [0, 1]
+    xyz    = np.asarray(pcd.points,  dtype=np.float64)
+    colors = np.asarray(pcd.colors,  dtype=np.float64)   # [0, 1]
 
     print(f"Loaded  : {path.name}")
     print(f"Points  : {len(xyz):,}")
     print(
         f"XYZ range  "
-        f"X=[{xyz[:, 0].min():.3f}, {xyz[:, 0].max():.3f}]  "
-        f"Y=[{xyz[:, 1].min():.3f}, {xyz[:, 1].max():.3f}]  "
-        f"Z=[{xyz[:, 2].min():.3f}, {xyz[:, 2].max():.3f}]"
+        f"X=[{xyz[:,0].min():.3f}, {xyz[:,0].max():.3f}]  "
+        f"Y=[{xyz[:,1].min():.3f}, {xyz[:,1].max():.3f}]  "
+        f"Z=[{xyz[:,2].min():.3f}, {xyz[:,2].max():.3f}]"
     )
     return xyz, colors
 
 
-def _quantise_colors(colors: np.ndarray, tolerance: int) -> np.ndarray:
-    """
-    Convert float [0, 1] RGB to uint8 and snap each channel to the nearest
-    multiple of `tolerance`.
+# ══════════════════════════════════════════════════════════════════════════════
+# RGB → HSV  (vectorised, no OpenCV dependency)
+# ══════════════════════════════════════════════════════════════════════════════
 
-    Using *round* (not floor-divide) ensures that two values that differ by
-    less than tolerance/2 on every channel map to the same representative
-    and are therefore merged into a single segment — regardless of which
-    side of a bucket boundary they happen to sit on.
+def rgb_to_hsv(colors: np.ndarray) -> np.ndarray:
+    """
+    Convert (N, 3) float RGB in [0,1] → (N, 3) HSV.
+      H : [0, 2π)   (radians, circular)
+      S : [0, 1]
+      V : [0, 1]
+    """
+    r, g, b = colors[:, 0], colors[:, 1], colors[:, 2]
+
+    v   = np.maximum.reduce([r, g, b])          # value
+    s   = np.where(v > 1e-8,
+                   (v - np.minimum.reduce([r, g, b])) / np.clip(v, 1e-8, None),
+                   0.0)                          # saturation
+
+    diff = np.clip(v - np.minimum.reduce([r, g, b]), 1e-8, None)
+
+    # Hue in [0, 6)
+    h = np.where(
+        v == r, (g - b) / diff % 6,
+        np.where(
+            v == g, (b - r) / diff + 2,
+                    (r - g) / diff + 4,
+        )
+    )
+    h = h / 6.0 * 2.0 * np.pi   # → radians [0, 2π)
+
+    return np.stack([h, s, v], axis=-1)          # (N, 3)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Build clustering feature vector
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_hsv_features(colors: np.ndarray, hsv_weight: float = 1.0) -> np.ndarray:
+    """
+    Build a clustering feature that captures gradient-color regions.
+
+    Feature = [cos(H)*S,  sin(H)*S,  V]
+
+    • (cos H * S, sin H * S)  encodes hue circularly, weighted by
+      saturation so that near-grey points (S≈0, hue undefined) don't
+      pollute hue-based clusters.
+    • V (brightness) is included to separate dark from bright regions.
 
     Parameters
     ----------
-    colors    : (N, 3) float64 in [0, 1]
-    tolerance : rounding granularity in uint8 space; 0 means exact match
+    colors     : (N, 3) float64 RGB in [0, 1]
+    hsv_weight : scale for the hue/saturation channels (default 1.0)
 
     Returns
     -------
-    (N, 3) uint8 — quantised color key for each point
+    features : (N, 3) float64
     """
-    colors_u8 = (colors * 255.0).round().astype(np.int16)   # int16 avoids overflow
+    hsv = rgb_to_hsv(colors)
+    h, s, v = hsv[:, 0], hsv[:, 1], hsv[:, 2]
 
-    if tolerance > 1:
-        # Round to nearest multiple of tolerance (not floor-divide).
-        # e.g. tolerance=4: 253→252, 254→252, 255→256→clipped to 255
-        colors_q = (np.round(colors_u8 / tolerance) * tolerance).astype(np.int16)
-        colors_q = np.clip(colors_q, 0, 255).astype(np.uint8)
-    elif tolerance == 1:
-        colors_q = colors_u8.clip(0, 255).astype(np.uint8)
-    else:
-        # tolerance == 0 → exact match
-        colors_q = colors_u8.clip(0, 255).astype(np.uint8)
+    cos_h = np.cos(h) * s * hsv_weight
+    sin_h = np.sin(h) * s * hsv_weight
+    val   = v
 
-    return colors_q
+    return np.stack([cos_h, sin_h, val], axis=-1)   # (N, 3)
 
 
-def group_by_color(
+# ══════════════════════════════════════════════════════════════════════════════
+# Cluster merging by hue proximity
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _mean_hue(colors_subset: np.ndarray) -> float:
+    """Circular mean hue (radians) of a color subset."""
+    hsv = rgb_to_hsv(colors_subset)
+    h   = hsv[:, 0]
+    return float(np.arctan2(np.sin(h).mean(), np.cos(h).mean()) % (2 * np.pi))
+
+
+def merge_close_hue_clusters(
+    labels: np.ndarray,
     colors: np.ndarray,
-    tolerance: int = DEFAULT_COLOR_TOLERANCE,
-    min_points: int = DEFAULT_MIN_POINTS,
-) -> dict[tuple[int, int, int], np.ndarray]:
+    merge_deg: float,
+) -> np.ndarray:
     """
-    Group point indices by their quantised RGB color so that ALL points
-    belonging to the same Utonia segment end up in exactly one group.
-
-    Utonia assigns a unique flat RGB to each PCA segment, so every group
-    of identically-colored points corresponds to one segment.
+    Merge any two clusters whose circular mean hue difference is less
+    than `merge_deg` degrees.  Uses greedy single-linkage on hue distance.
 
     Parameters
     ----------
-    colors     : (N, 3) float64 in [0, 1]
-    tolerance  : rounding granularity in uint8 space (0 = exact match,
-                 2-5 = tolerant, absorbs floating-point rounding)
-    min_points : groups smaller than this are discarded as noise
+    labels    : (N,) int — cluster labels (-1 = noise)
+    colors    : (N, 3) float64 RGB in [0, 1]
+    merge_deg : angular threshold in degrees
 
     Returns
     -------
-    dict mapping (R, G, B) uint8 tuple → array of point indices
+    new_labels : (N,) int — merged labels
     """
-    colors_q = _quantise_colors(colors, tolerance)   # (N, 3) uint8
+    if merge_deg <= 0:
+        return labels
 
-    # One pass: accumulate indices per quantised color key.
-    # Using a dict with tuple keys is the most reliable way to guarantee
-    # that every point with the same quantised color lands in the same bucket.
-    groups: dict[tuple[int, int, int], list[int]] = defaultdict(list)
-    for idx in range(len(colors_q)):
-        r, g, b = int(colors_q[idx, 0]), int(colors_q[idx, 1]), int(colors_q[idx, 2])
-        groups[(r, g, b)].append(idx)
+    merge_rad = np.deg2rad(merge_deg)
+    unique = [lbl for lbl in np.unique(labels) if lbl != -1]
+    mean_hues = {lbl: _mean_hue(colors[labels == lbl]) for lbl in unique}
 
-    # Filter noise groups and convert index lists to numpy arrays
-    segments: dict[tuple[int, int, int], np.ndarray] = {
-        color: np.array(indices, dtype=np.int64)
-        for color, indices in groups.items()
-        if len(indices) >= min_points
-    }
+    # Union-Find
+    parent = {lbl: lbl for lbl in unique}
 
-    n_total   = len(groups)
-    n_valid   = len(segments)
-    n_dropped = n_total - n_valid
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
 
-    print(f"\nUnique color groups          : {n_total}")
-    print(f"Valid segments (≥{min_points} pts)   : {n_valid}")
-    print(f"Dropped (too small)          : {n_dropped}")
+    def union(a, b):
+        parent[find(a)] = find(b)
 
-    return segments
+    for i, la in enumerate(unique):
+        for lb in unique[i + 1:]:
+            diff = abs(mean_hues[la] - mean_hues[lb])
+            diff = min(diff, 2 * np.pi - diff)   # circular distance
+            if diff < merge_rad:
+                union(la, lb)
 
+    # Re-map labels through union-find
+    root_to_new: dict[int, int] = {}
+    new_id = 0
+    new_labels = labels.copy()
+    for lbl in unique:
+        root = find(lbl)
+        if root not in root_to_new:
+            root_to_new[root] = new_id
+            new_id += 1
+        new_labels[labels == lbl] = root_to_new[root]
+
+    n_before = len(unique)
+    n_after  = len(set(root_to_new.values()))
+    if n_after < n_before:
+        print(f"Merged {n_before} → {n_after} clusters "
+              f"(hue threshold {merge_deg:.1f}°)")
+    return new_labels
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Clustering
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _estimate_k(features: np.ndarray, k_min: int = 2, k_max: int = 20) -> int:
+    """Estimate K via the elbow method on a 50 k-point sub-sample."""
+    rng     = np.random.default_rng(42)
+    idx     = rng.choice(len(features), size=min(50_000, len(features)), replace=False)
+    sample  = features[idx]
+    inertias = []
+    ks       = list(range(k_min, k_max + 1))
+    for k in ks:
+        km = KMeans(n_clusters=k, n_init=3, random_state=42, max_iter=100)
+        km.fit(sample)
+        inertias.append(km.inertia_)
+    if len(inertias) < 3:
+        return k_min
+    d2    = np.diff(np.diff(inertias))
+    best_k = ks[int(np.argmax(d2)) + 1]
+    print(f"Auto-estimated K = {best_k}")
+    return best_k
+
+
+def segment_by_kmeans(
+    colors: np.ndarray,
+    n_segments: int | None = None,
+    min_points: int = DEFAULT_MIN_POINTS,
+) -> np.ndarray:
+    """
+    Cluster gradient-color regions with K-Means in HSV feature space.
+
+    Parameters
+    ----------
+    colors     : (N, 3) float64 RGB in [0, 1]
+    n_segments : K; auto-estimated if None
+    min_points : clusters smaller than this become noise (-1)
+
+    Returns
+    -------
+    labels : (N,) int
+    """
+    features = build_hsv_features(colors)
+    k = n_segments if n_segments is not None else _estimate_k(features)
+
+    print(f"Running K-Means (K={k}) in HSV feature space …")
+    km     = KMeans(n_clusters=k, n_init=10, random_state=42, max_iter=300)
+    labels = km.fit_predict(features).astype(np.int32)
+
+    # Mark tiny clusters as noise
+    for lbl in np.unique(labels):
+        if (labels == lbl).sum() < min_points:
+            labels[labels == lbl] = -1
+
+    n_valid = len(np.unique(labels[labels != -1]))
+    print(f"K-Means gradient-color segments (after noise filter): {n_valid}")
+    return labels
+
+
+def segment_by_dbscan(
+    colors: np.ndarray,
+    eps: float = DEFAULT_DBSCAN_EPS,
+    min_pts: int = DEFAULT_DBSCAN_MIN_PTS,
+    min_points: int = DEFAULT_MIN_POINTS,
+) -> np.ndarray:
+    """
+    Cluster gradient-color regions with DBSCAN in HSV feature space.
+
+    Parameters
+    ----------
+    colors     : (N, 3) float64 RGB in [0, 1]
+    eps        : neighborhood radius in HSV feature space
+    min_pts    : DBSCAN min_samples
+    min_points : clusters smaller than this become noise (-1)
+
+    Returns
+    -------
+    labels : (N,) int
+    """
+    features = build_hsv_features(colors)
+
+    print(f"Running DBSCAN (eps={eps}, min_samples={min_pts}) in HSV feature space …")
+    db     = DBSCAN(eps=eps, min_samples=min_pts, n_jobs=-1)
+    labels = db.fit_predict(features).astype(np.int32)
+
+    for lbl in np.unique(labels):
+        if lbl == -1:
+            continue
+        if (labels == lbl).sum() < min_points:
+            labels[labels == lbl] = -1
+
+    n_valid = len(np.unique(labels[labels != -1]))
+    print(f"DBSCAN gradient-color segments (after noise filter): {n_valid}  "
+          f"(noise pts: {(labels == -1).sum():,})")
+    return labels
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Export
+# ══════════════════════════════════════════════════════════════════════════════
 
 def save_segments(
     xyz: np.ndarray,
     colors: np.ndarray,
-    segments: dict[tuple[int, int, int], np.ndarray],
+    labels: np.ndarray,
     output_dir: Path,
-) -> list[Path]:
+) -> tuple[list[Path], list[int]]:
     """
-    Write ONE .ply file per segment color.
+    Write one .ply per gradient-color segment (noise label -1 is skipped).
 
-    All points that share the same quantised RGB (i.e. the same Utonia
-    segment label) are written together into a single file.
-
-    File naming convention:
-        segment_<id>_rgb<R>-<G>-<B>.ply
+    File naming: segment_<id>_hue<mean_hue_deg>.ply
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     saved: list[Path] = []
+    unique_labels = sorted(lbl for lbl in np.unique(labels) if lbl != -1)
 
-    for seg_id, (color_key, indices) in enumerate(segments.items()):
-        seg_xyz    = xyz[indices]
-        seg_colors = colors[indices]   # float [0, 1] — Open3D expects this
+    for seg_id, lbl in enumerate(unique_labels):
+        mask       = labels == lbl
+        seg_xyz    = xyz[mask]
+        seg_colors = colors[mask]
+
+        # Compute mean hue for the filename (human-readable)
+        mean_hue_deg = int(np.rad2deg(_mean_hue(seg_colors)) % 360)
 
         seg_pcd = o3d.geometry.PointCloud()
         seg_pcd.points = o3d.utility.Vector3dVector(seg_xyz)
         seg_pcd.colors = o3d.utility.Vector3dVector(seg_colors)
 
-        r, g, b   = color_key
-        out_file  = output_dir / f"segment_{seg_id:04d}_rgb{r:03d}-{g:03d}-{b:03d}.ply"
+        out_file = output_dir / f"segment_{seg_id:04d}_hue{mean_hue_deg:03d}deg.ply"
         o3d.io.write_point_cloud(str(out_file), seg_pcd)
         saved.append(out_file)
 
     print(f"\nSaved {len(saved)} segment file(s) → '{output_dir.resolve()}'")
-    return saved
+    return saved, unique_labels
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Dimension reporting
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Approximate hue → color name mapping (HSV hue in degrees)
+_HUE_NAMES = [
+    (  0,  15, "red"),
+    ( 15,  45, "orange"),
+    ( 45,  70, "yellow"),
+    ( 70, 150, "green"),
+    (150, 190, "cyan"),
+    (190, 260, "blue"),
+    (260, 290, "indigo"),
+    (290, 330, "pink/magenta"),
+    (330, 360, "red"),
+]
+
+def _hue_name(hue_deg: float) -> str:
+    for lo, hi, name in _HUE_NAMES:
+        if lo <= hue_deg < hi:
+            return name
+    return "unknown"
 
 
 def print_dimensions(
     xyz: np.ndarray,
-    segments: dict[tuple[int, int, int], np.ndarray],
+    colors: np.ndarray,
+    labels: np.ndarray,
+    unique_labels: list[int],
     saved_paths: list[Path],
 ) -> None:
     """
-    Print the axis-aligned bounding-box dimensions of every segment.
+    Print AABB height / width / depth and dominant hue for every segment.
 
-    Definitions
-    -----------
     height : Z-axis extent  (z_max − z_min)
     width  : X-axis extent  (x_max − x_min)
-    depth  : Y-axis extent  (y_max − y_min)  — reported for completeness
+    depth  : Y-axis extent  (y_max − y_min)
     """
-    col_w = 76
+    col_w = 86
     print("\n" + "═" * col_w)
-    print(f"  SEGMENT DIMENSIONS  ({len(segments)} object(s))")
+    print(f"  GRADIENT-COLOR SEGMENT DIMENSIONS  ({len(unique_labels)} region(s))")
     print("═" * col_w)
     print(
-        f"{'ID':>4}  {'Color (R,G,B)':>16}  {'Pts':>7}"
-        f"  {'Width(X)':>9}  {'Depth(Y)':>9}  {'Height(Z)':>10}"
+        f"{'ID':>4}  {'Hue (name)':>16}  {'Pts':>8}  "
+        f"{'Width(X)':>9}  {'Depth(Y)':>9}  {'Height(Z)':>10}  File"
     )
     print("─" * col_w)
 
-    for seg_id, (color_key, indices) in enumerate(segments.items()):
-        seg_xyz = xyz[indices]
-        r, g, b = color_key
+    for seg_id, lbl in enumerate(unique_labels):
+        mask       = labels == lbl
+        seg_xyz    = xyz[mask]
+        seg_colors = colors[mask]
 
-        x_min, x_max = float(seg_xyz[:, 0].min()), float(seg_xyz[:, 0].max())
-        y_min, y_max = float(seg_xyz[:, 1].min()), float(seg_xyz[:, 1].max())
-        z_min, z_max = float(seg_xyz[:, 2].min()), float(seg_xyz[:, 2].max())
+        x_min, x_max = float(seg_xyz[:,0].min()), float(seg_xyz[:,0].max())
+        y_min, y_max = float(seg_xyz[:,1].min()), float(seg_xyz[:,1].max())
+        z_min, z_max = float(seg_xyz[:,2].min()), float(seg_xyz[:,2].max())
 
-        width  = x_max - x_min   # X-extent → "width"
-        depth  = y_max - y_min   # Y-extent → "depth"
-        height = z_max - z_min   # Z-extent → "height"
+        width  = x_max - x_min
+        depth  = y_max - y_min
+        height = z_max - z_min
 
-        color_str = f"({r:3d},{g:3d},{b:3d})"
+        hue_deg  = np.rad2deg(_mean_hue(seg_colors)) % 360
+        hue_str  = f"{hue_deg:5.1f}° ({_hue_name(hue_deg)})"
+
         print(
-            f"{seg_id:>4}  {color_str:>16}  {len(indices):>7,}"
-            f"  {width:>9.4f}  {depth:>9.4f}  {height:>10.4f}"
+            f"{seg_id:>4}  {hue_str:>16}  {mask.sum():>8,}  "
+            f"{width:>9.4f}  {depth:>9.4f}  {height:>10.4f}  "
+            f"{saved_paths[seg_id].name}"
         )
-        print(f"{'':>4}  {'↳ file':>16}: {saved_paths[seg_id].name}")
 
     print("═" * col_w)
     print("  Units match the coordinate units of the input point cloud.")
@@ -245,38 +466,49 @@ def print_dimensions(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CLI entry point
-# ═════════════════════════════���════════════════════════════════════════════════
+# CLI
+# ══════════════════════════════════════════════════════════════════════════════
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
-            "Export segments from a Utonia / PCA color-segmented point cloud "
-            "and report their height & width.  All points of the same segment "
-            "color are guaranteed to be written into a single .ply file."
+            "Export gradient-color regions from a Utonia PCA-colored point cloud.\n"
+            "Segments are recovered by clustering in HSV hue space — the same\n"
+            "color space that get_pca_color() in app.py produces.\n\n"
+            "Examples:\n"
+            "  python utonia_segment_exporter.py --input scene.ply\n"
+            "  python utonia_segment_exporter.py --input scene.ply --n_segments 8\n"
+            "  python utonia_segment_exporter.py --input scene.ply --method dbscan --eps 0.1\n"
+            "  python utonia_segment_exporter.py --input scene.ply --merge_deg 15\n"
         ),
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument(
-        "--input", "-i", required=True,
-        help="Path to the Utonia PCA color-segmented .ply file.",
-    )
-    p.add_argument(
-        "--output_dir", "-o", default=DEFAULT_OUTPUT_DIR,
-        help="Directory where per-segment .ply files will be written.",
-    )
-    p.add_argument(
-        "--tolerance", "-t", type=int, default=DEFAULT_COLOR_TOLERANCE,
-        help=(
-            "RGB rounding tolerance (uint8). "
-            "0 = exact color match; 2-5 absorbs minor float-rounding differences. "
-            "Colors within tolerance/2 on every channel are merged into one segment."
-        ),
-    )
-    p.add_argument(
-        "--min_points", "-m", type=int, default=DEFAULT_MIN_POINTS,
-        help="Minimum number of points for a segment to be kept.",
-    )
+    p.add_argument("--input",  "-i", required=True,
+                   help="Utonia PCA-colored .ply file.")
+    p.add_argument("--output_dir", "-o", default=DEFAULT_OUTPUT_DIR,
+                   help="Output directory for per-segment .ply files.")
+    p.add_argument("--method", "-M", default=DEFAULT_METHOD,
+                   choices=["kmeans", "dbscan"],
+                   help="Clustering method (default: kmeans).")
+
+    # K-Means
+    p.add_argument("--n_segments", "-k", type=int, default=DEFAULT_N_SEGMENTS,
+                   help="[K-Means] Number of gradient-color segments K. "
+                        "Auto-estimated if omitted.")
+
+    # DBSCAN
+    p.add_argument("--eps", "-e", type=float, default=DEFAULT_DBSCAN_EPS,
+                   help="[DBSCAN] Neighborhood radius in HSV feature space.")
+    p.add_argument("--min_pts", type=int, default=DEFAULT_DBSCAN_MIN_PTS,
+                   help="[DBSCAN] min_samples parameter.")
+
+    # Common
+    p.add_argument("--min_points", "-m", type=int, default=DEFAULT_MIN_POINTS,
+                   help="Min points per segment; smaller clusters = noise.")
+    p.add_argument("--merge_deg", type=float, default=DEFAULT_MERGE_DEG,
+                   help="Merge clusters whose mean hue differs by less than "
+                        "this many degrees (0 = no merging). "
+                        "E.g. --merge_deg 20 collapses near-pink and pink together.")
     return p
 
 
@@ -290,17 +522,30 @@ def main() -> None:
     # 1. Load
     xyz, colors = load_pointcloud(input_path)
 
-    # 2. Group by segment color — all similar colors → one group → one file
-    segments = group_by_color(colors, args.tolerance, args.min_points)
+    # 2. Cluster by gradient-color region (HSV hue space)
+    if args.method == "kmeans":
+        labels = segment_by_kmeans(colors, args.n_segments, args.min_points)
+    else:
+        labels = segment_by_dbscan(colors, args.eps, args.min_pts, args.min_points)
 
-    if not segments:
-        sys.exit("No valid segments found.  Try lowering --min_points or --tolerance.")
+    # 3. Optionally merge clusters with similar hues
+    if args.merge_deg > 0:
+        labels = merge_close_hue_clusters(labels, colors, args.merge_deg)
 
-    # 3. Save — one .ply per segment color
-    saved_paths = save_segments(xyz, colors, segments, Path(args.output_dir))
+    n_valid = len(np.unique(labels[labels != -1]))
+    if n_valid == 0:
+        sys.exit(
+            "No valid segments found.\n"
+            "  • K-Means : try a different --n_segments value.\n"
+            "  • DBSCAN  : try a smaller --eps or --min_pts value.\n"
+            "  • Both    : try lowering --min_points."
+        )
 
-    # 4. Print height / width table
-    print_dimensions(xyz, segments, saved_paths)
+    # 4. Save — one .ply per gradient-color region
+    saved_paths, unique_labels = save_segments(xyz, colors, labels, Path(args.output_dir))
+
+    # 5. Print dimension table with hue names
+    print_dimensions(xyz, colors, labels, unique_labels, saved_paths)
 
 
 if __name__ == "__main__":
