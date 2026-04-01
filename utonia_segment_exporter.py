@@ -1,47 +1,35 @@
 """
 utonia_segment_exporter.py
 ==========================
-Reads a color-segmented point cloud produced by Utonia's PCA pipeline
-(.ply with per-point float RGB in [0,1]), recovers segments by grouping
-points that share the same **hue band** in HSV space, writes ONE .ply
-file per gradient-color region, and prints the height / width of every
-segmented object.
+Reads a Utonia PCA-colored point cloud (.ply, float RGB in [0,1]),
+groups points by gradient-color region (pink, yellow, orange, etc.),
+saves one .ply per region, and prints AABB height / width / depth.
 
-Why HSV hue-band clustering?
------------------------------
-Utonia's get_pca_color (app.py) produces colors via:
+Color encoding strategy
+-----------------------
+Utonia's get_pca_color() (app.py) produces float RGB via min-max
+normalised PCA projection.  Semantically related points share a
+similar *hue* in HSV space.
 
-    u, s, v  = torch.pca_lowrank(feat, center=True, q=3*(start+1))
-    proj     = feat @ v                       # (N, 3)  PCA projection
-    proj     = minmax_normalize(proj)         # → float RGB in [0, 1]
-    color    = clamp(proj * brightness, 0, 1)
+The previous (cos H·S, sin H·S, V) 3-D feature caused yellow/orange
+bleed because:
+  • cos(60°) ≈ 0.50  vs  cos(30°) ≈ 0.87  — only 0.37 apart
+  • sin(60°) ≈ 0.87  vs  sin(30°) ≈ 0.50  — only 0.37 apart
+  → 2-D distance ≈ 0.52, easily collapsed by K-Means or DBSCAN
 
-Points belonging to the same semantic region share similar PCA
-projection values → similar **hue** when viewed in HSV.
-"Pink", "yellow", "cyan" etc. are hue bands — clustering in circular
-hue space is therefore the most faithful way to recover PCA segments.
-
-Clustering pipeline
--------------------
-1. Convert float RGB [0,1] → HSV.
-2. Build a (cos H, sin H, S, V) feature for circular-safe clustering.
-3. K-Means (default, fast) or DBSCAN (no-K fallback) on that feature.
-4. Optional: merge any two clusters whose mean hue differs < --merge_deg.
-5. Save one .ply per cluster, print AABB dimensions.
+Fix: replace the 2-D circular encoding with a **soft hue histogram**
+(N_BINS Gaussian-weighted bins covering 0-360°).  Yellow lands heavily
+in bin ~60° while orange lands heavily in bin ~30°, giving them
+a much larger feature-space separation.  Saturation and value are
+appended as separate channels so grey/dark regions don't misfire.
 
 Usage
 -----
-    # Auto-estimate K (elbow method):
     python utonia_segment_exporter.py --input scene_pca.ply
-
-    # Explicit K:
-    python utonia_segment_exporter.py --input scene_pca.ply --n_segments 8
-
-    # DBSCAN (no K needed):
-    python utonia_segment_exporter.py --input scene_pca.ply --method dbscan --eps 0.12
-
-    # Merge clusters whose hues are within 15 degrees of each other:
-    python utonia_segment_exporter.py --input scene_pca.ply --merge_deg 15
+    python utonia_segment_exporter.py --input scene_pca.ply --n_segments 10
+    python utonia_segment_exporter.py --input scene_pca.ply --method dbscan --eps 0.25
+    python utonia_segment_exporter.py --input scene_pca.ply --merge_deg 12
+    python utonia_segment_exporter.py --input scene_pca.ply --hue_bins 36 --hue_sigma 8
 
 Requirements
 ------------
@@ -63,6 +51,7 @@ except ImportError:
 
 try:
     from sklearn.cluster import KMeans, DBSCAN
+    from sklearn.preprocessing import normalize
 except ImportError:
     sys.exit("scikit-learn is not installed.  Run:  pip install scikit-learn")
 
@@ -71,37 +60,35 @@ except ImportError:
 # Defaults
 # ══════════════════════════════════════════════════════════════════════════════
 
-DEFAULT_OUTPUT_DIR     = "segments_out"
-DEFAULT_METHOD         = "kmeans"
-DEFAULT_N_SEGMENTS     = None   # None → auto-estimate via elbow
-DEFAULT_DBSCAN_EPS     = 0.12   # in HSV feature space
-DEFAULT_DBSCAN_MIN_PTS = 50
-DEFAULT_MIN_POINTS     = 10     # clusters smaller than this = noise
-DEFAULT_MERGE_DEG      = 0.0    # 0 = no merging
+DEFAULT_OUTPUT_DIR      = "segments_out"
+DEFAULT_METHOD          = "kmeans"
+DEFAULT_N_SEGMENTS      = None   # None → auto-estimate via elbow
+DEFAULT_DBSCAN_EPS      = 0.25   # in soft-hue-histogram feature space
+DEFAULT_DBSCAN_MIN_PTS  = 50
+DEFAULT_MIN_POINTS      = 10
+
+DEFAULT_HUE_BINS        = 36     # one bin per 10° → fine enough to separate yellow/orange
+DEFAULT_HUE_SIGMA_DEG   = 8.0    # Gaussian width per bin (degrees)
+DEFAULT_HUE_WEIGHT      = 3.0    # scale applied to hue histogram channels vs S/V
+DEFAULT_MERGE_DEG       = 0.0    # 0 = no post-merge
 
 
-# ══════════════════════���═══════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 # I/O
 # ══════════════════════════════════════════════════════════════════════════════
 
 def load_pointcloud(path: Path) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Load a .ply and return:
-      xyz    : (N, 3) float64 — XYZ coordinates
-      colors : (N, 3) float64 — float RGB in [0, 1]  (Utonia PCA colors)
-    """
+    """Return (xyz float64, colors float64 [0,1])."""
     pcd = o3d.io.read_point_cloud(str(path))
     if len(pcd.points) == 0:
         sys.exit(f"ERROR: Point cloud is empty: {path}")
     if not pcd.has_colors():
         sys.exit(
-            "ERROR: The point cloud has no color information.\n"
-            "Please supply the Utonia PCA-colored output (.ply with float RGB)."
+            "ERROR: No color data found.\n"
+            "Please supply the Utonia PCA-colored .ply (float RGB)."
         )
-
     xyz    = np.asarray(pcd.points,  dtype=np.float64)
-    colors = np.asarray(pcd.colors,  dtype=np.float64)   # [0, 1]
-
+    colors = np.asarray(pcd.colors,  dtype=np.float64)
     print(f"Loaded  : {path.name}")
     print(f"Points  : {len(xyz):,}")
     print(
@@ -114,81 +101,121 @@ def load_pointcloud(path: Path) -> tuple[np.ndarray, np.ndarray]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# RGB → HSV  (vectorised, no OpenCV dependency)
+# RGB → HSV  (vectorised, no OpenCV)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def rgb_to_hsv(colors: np.ndarray) -> np.ndarray:
     """
-    Convert (N, 3) float RGB in [0,1] → (N, 3) HSV.
-      H : [0, 2π)   (radians, circular)
+    (N,3) float64 RGB [0,1] → (N,3) HSV
+      H : [0, 360)  degrees
       S : [0, 1]
       V : [0, 1]
     """
     r, g, b = colors[:, 0], colors[:, 1], colors[:, 2]
+    v       = np.maximum.reduce([r, g, b])
+    mn      = np.minimum.reduce([r, g, b])
+    diff    = np.clip(v - mn, 1e-8, None)
+    s       = np.where(v > 1e-8, diff / np.clip(v, 1e-8, None), 0.0)
 
-    v   = np.maximum.reduce([r, g, b])          # value
-    s   = np.where(v > 1e-8,
-                   (v - np.minimum.reduce([r, g, b])) / np.clip(v, 1e-8, None),
-                   0.0)                          # saturation
-
-    diff = np.clip(v - np.minimum.reduce([r, g, b]), 1e-8, None)
-
-    # Hue in [0, 6)
-    h = np.where(
-        v == r, (g - b) / diff % 6,
-        np.where(
-            v == g, (b - r) / diff + 2,
-                    (r - g) / diff + 4,
-        )
+    h = np.select(
+        [v == r,      v == g],
+        [(g - b) / diff % 6,
+         (b - r) / diff + 2],
+        default=(r - g) / diff + 4,
     )
-    h = h / 6.0 * 2.0 * np.pi   # → radians [0, 2π)
-
-    return np.stack([h, s, v], axis=-1)          # (N, 3)
+    h = (h / 6.0 * 360.0) % 360.0   # degrees [0, 360)
+    return np.stack([h, s, v], axis=-1)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Build clustering feature vector
+# Soft hue-histogram feature  (the core improvement)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_hsv_features(colors: np.ndarray, hsv_weight: float = 1.0) -> np.ndarray:
+def build_soft_hue_features(
+    colors: np.ndarray,
+    n_bins:     int   = DEFAULT_HUE_BINS,
+    sigma_deg:  float = DEFAULT_HUE_SIGMA_DEG,
+    hue_weight: float = DEFAULT_HUE_WEIGHT,
+) -> np.ndarray:
     """
-    Build a clustering feature that captures gradient-color regions.
+    Build a (N, n_bins + 2) feature matrix for clustering.
 
-    Feature = [cos(H)*S,  sin(H)*S,  V]
+    Channels
+    --------
+    0 … n_bins-1 : soft hue histogram
+        Each bin centre is at  k * (360 / n_bins)  degrees.
+        Contribution of a point with hue H to bin k:
 
-    • (cos H * S, sin H * S)  encodes hue circularly, weighted by
-      saturation so that near-grey points (S≈0, hue undefined) don't
-      pollute hue-based clusters.
-    • V (brightness) is included to separate dark from bright regions.
+            w_k = exp( -0.5 * circular_dist(H, centre_k)² / sigma² )
+
+        The row is then multiplied by S (saturation) so that near-grey
+        points (S ≈ 0, hue undefined) produce a near-zero histogram and
+        don't pollute hue-based clusters.  Rows are L2-normalised.
+
+        With n_bins=36 (10°/bin) and sigma=8°:
+          • Yellow (H≈60°) activates bins 5-7 strongly
+          • Orange (H≈30°) activates bins 2-4 strongly
+          → ~3 bins of separation → clear cluster boundary
+
+    n_bins     : saturation  S  (scalar)
+    n_bins + 1 : value        V  (scalar)
+
+    The hue channels are scaled by `hue_weight` before clustering so
+    that colour differences dominate over brightness differences.
 
     Parameters
     ----------
     colors     : (N, 3) float64 RGB in [0, 1]
-    hsv_weight : scale for the hue/saturation channels (default 1.0)
+    n_bins     : number of hue bins  (36 → 10°/bin, 72 → 5°/bin)
+    sigma_deg  : Gaussian half-width per bin in degrees
+    hue_weight : multiplier for hue channels vs S/V
 
     Returns
     -------
-    features : (N, 3) float64
+    features : (N, n_bins + 2) float32
     """
-    hsv = rgb_to_hsv(colors)
-    h, s, v = hsv[:, 0], hsv[:, 1], hsv[:, 2]
+    hsv = rgb_to_hsv(colors)                   # (N, 3)
+    H   = hsv[:, 0]                            # degrees [0, 360)
+    S   = hsv[:, 1]
+    V   = hsv[:, 2]
 
-    cos_h = np.cos(h) * s * hsv_weight
-    sin_h = np.sin(h) * s * hsv_weight
-    val   = v
+    # Bin centres: 0°, 360/n_bins°, 2·360/n_bins°, …
+    centres = np.linspace(0.0, 360.0, n_bins, endpoint=False)   # (n_bins,)
 
-    return np.stack([cos_h, sin_h, val], axis=-1)   # (N, 3)
+    # Circular distance: (N, n_bins)
+    diff_deg = H[:, None] - centres[None, :]           # (N, n_bins)
+    diff_deg = (diff_deg + 180.0) % 360.0 - 180.0      # wrap to [-180, 180)
+
+    # Soft Gaussian activation per bin
+    hist = np.exp(-0.5 * (diff_deg / sigma_deg) ** 2)  # (N, n_bins)
+
+    # Weight by saturation: grey points → near-zero histogram
+    hist = hist * S[:, None]                            # (N, n_bins)
+
+    # L2-normalise each row (so that overall brightness doesn't dominate)
+    row_norms = np.linalg.norm(hist, axis=1, keepdims=True)
+    hist      = hist / np.where(row_norms > 1e-8, row_norms, 1.0)
+
+    # Scale hue channels relative to S and V
+    hist_weighted = hist * hue_weight                   # (N, n_bins)
+
+    # Append S and V as scalar channels
+    features = np.concatenate(
+        [hist_weighted, S[:, None], V[:, None]], axis=1
+    ).astype(np.float32)                               # (N, n_bins+2)
+
+    return features
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Cluster merging by hue proximity
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══���══════════════════════════════════════════════════════════════════════════
 
-def _mean_hue(colors_subset: np.ndarray) -> float:
-    """Circular mean hue (radians) of a color subset."""
-    hsv = rgb_to_hsv(colors_subset)
-    h   = hsv[:, 0]
-    return float(np.arctan2(np.sin(h).mean(), np.cos(h).mean()) % (2 * np.pi))
+def _mean_hue_deg(colors_subset: np.ndarray) -> float:
+    """Circular mean hue (degrees) of a subset of float-RGB points."""
+    h_rad = np.deg2rad(rgb_to_hsv(colors_subset)[:, 0])
+    return float(np.rad2deg(np.arctan2(np.sin(h_rad).mean(),
+                                       np.cos(h_rad).mean())) % 360.0)
 
 
 def merge_close_hue_clusters(
@@ -197,28 +224,17 @@ def merge_close_hue_clusters(
     merge_deg: float,
 ) -> np.ndarray:
     """
-    Merge any two clusters whose circular mean hue difference is less
-    than `merge_deg` degrees.  Uses greedy single-linkage on hue distance.
-
-    Parameters
-    ----------
-    labels    : (N,) int — cluster labels (-1 = noise)
-    colors    : (N, 3) float64 RGB in [0, 1]
-    merge_deg : angular threshold in degrees
-
-    Returns
-    -------
-    new_labels : (N,) int — merged labels
+    Greedy single-linkage merge of clusters whose circular mean hue
+    difference is less than `merge_deg` degrees.
     """
-    if merge_deg <= 0:
+    if merge_deg <= 0.0:
         return labels
 
-    merge_rad = np.deg2rad(merge_deg)
-    unique = [lbl for lbl in np.unique(labels) if lbl != -1]
-    mean_hues = {lbl: _mean_hue(colors[labels == lbl]) for lbl in unique}
+    unique = [l for l in np.unique(labels) if l != -1]
+    mean_h = {l: _mean_hue_deg(colors[labels == l]) for l in unique}
 
     # Union-Find
-    parent = {lbl: lbl for lbl in unique}
+    parent = {l: l for l in unique}
 
     def find(x):
         while parent[x] != x:
@@ -231,21 +247,20 @@ def merge_close_hue_clusters(
 
     for i, la in enumerate(unique):
         for lb in unique[i + 1:]:
-            diff = abs(mean_hues[la] - mean_hues[lb])
-            diff = min(diff, 2 * np.pi - diff)   # circular distance
-            if diff < merge_rad:
+            d = abs(mean_h[la] - mean_h[lb])
+            d = min(d, 360.0 - d)
+            if d < merge_deg:
                 union(la, lb)
 
-    # Re-map labels through union-find
     root_to_new: dict[int, int] = {}
     new_id = 0
     new_labels = labels.copy()
-    for lbl in unique:
-        root = find(lbl)
+    for l in unique:
+        root = find(l)
         if root not in root_to_new:
             root_to_new[root] = new_id
             new_id += 1
-        new_labels[labels == lbl] = root_to_new[root]
+        new_labels[labels == l] = root_to_new[root]
 
     n_before = len(unique)
     n_after  = len(set(root_to_new.values()))
@@ -256,14 +271,17 @@ def merge_close_hue_clusters(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Clustering
+# K estimation (elbow on soft-hue features)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _estimate_k(features: np.ndarray, k_min: int = 2, k_max: int = 20) -> int:
-    """Estimate K via the elbow method on a 50 k-point sub-sample."""
-    rng     = np.random.default_rng(42)
-    idx     = rng.choice(len(features), size=min(50_000, len(features)), replace=False)
-    sample  = features[idx]
+def _estimate_k(
+    features: np.ndarray,
+    k_min: int = 2,
+    k_max: int = 20,
+) -> int:
+    rng    = np.random.default_rng(42)
+    idx    = rng.choice(len(features), size=min(50_000, len(features)), replace=False)
+    sample = features[idx]
     inertias = []
     ks       = list(range(k_min, k_max + 1))
     for k in ks:
@@ -272,42 +290,39 @@ def _estimate_k(features: np.ndarray, k_min: int = 2, k_max: int = 20) -> int:
         inertias.append(km.inertia_)
     if len(inertias) < 3:
         return k_min
-    d2    = np.diff(np.diff(inertias))
+    d2     = np.diff(np.diff(inertias))
     best_k = ks[int(np.argmax(d2)) + 1]
     print(f"Auto-estimated K = {best_k}")
     return best_k
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Clustering
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _filter_noise(labels: np.ndarray, min_points: int) -> np.ndarray:
+    """Mark clusters smaller than min_points as noise (-1)."""
+    labels = labels.copy()
+    for lbl in np.unique(labels):
+        if lbl != -1 and (labels == lbl).sum() < min_points:
+            labels[labels == lbl] = -1
+    return labels
+
+
 def segment_by_kmeans(
     colors: np.ndarray,
-    n_segments: int | None = None,
-    min_points: int = DEFAULT_MIN_POINTS,
+    n_segments: int | None,
+    min_points: int,
+    n_bins: int,
+    sigma_deg: float,
+    hue_weight: float,
 ) -> np.ndarray:
-    """
-    Cluster gradient-color regions with K-Means in HSV feature space.
-
-    Parameters
-    ----------
-    colors     : (N, 3) float64 RGB in [0, 1]
-    n_segments : K; auto-estimated if None
-    min_points : clusters smaller than this become noise (-1)
-
-    Returns
-    -------
-    labels : (N,) int
-    """
-    features = build_hsv_features(colors)
-    k = n_segments if n_segments is not None else _estimate_k(features)
-
-    print(f"Running K-Means (K={k}) in HSV feature space …")
+    features = build_soft_hue_features(colors, n_bins, sigma_deg, hue_weight)
+    k        = n_segments if n_segments is not None else _estimate_k(features)
+    print(f"Running K-Means (K={k}, hue_bins={n_bins}, σ={sigma_deg}°) …")
     km     = KMeans(n_clusters=k, n_init=10, random_state=42, max_iter=300)
     labels = km.fit_predict(features).astype(np.int32)
-
-    # Mark tiny clusters as noise
-    for lbl in np.unique(labels):
-        if (labels == lbl).sum() < min_points:
-            labels[labels == lbl] = -1
-
+    labels = _filter_noise(labels, min_points)
     n_valid = len(np.unique(labels[labels != -1]))
     print(f"K-Means gradient-color segments (after noise filter): {n_valid}")
     return labels
@@ -315,38 +330,21 @@ def segment_by_kmeans(
 
 def segment_by_dbscan(
     colors: np.ndarray,
-    eps: float = DEFAULT_DBSCAN_EPS,
-    min_pts: int = DEFAULT_DBSCAN_MIN_PTS,
-    min_points: int = DEFAULT_MIN_POINTS,
+    eps: float,
+    min_pts: int,
+    min_points: int,
+    n_bins: int,
+    sigma_deg: float,
+    hue_weight: float,
 ) -> np.ndarray:
-    """
-    Cluster gradient-color regions with DBSCAN in HSV feature space.
-
-    Parameters
-    ----------
-    colors     : (N, 3) float64 RGB in [0, 1]
-    eps        : neighborhood radius in HSV feature space
-    min_pts    : DBSCAN min_samples
-    min_points : clusters smaller than this become noise (-1)
-
-    Returns
-    -------
-    labels : (N,) int
-    """
-    features = build_hsv_features(colors)
-
-    print(f"Running DBSCAN (eps={eps}, min_samples={min_pts}) in HSV feature space …")
+    features = build_soft_hue_features(colors, n_bins, sigma_deg, hue_weight)
+    print(f"Running DBSCAN (eps={eps}, min_samples={min_pts}, "
+          f"hue_bins={n_bins}, σ={sigma_deg}°) …")
     db     = DBSCAN(eps=eps, min_samples=min_pts, n_jobs=-1)
     labels = db.fit_predict(features).astype(np.int32)
-
-    for lbl in np.unique(labels):
-        if lbl == -1:
-            continue
-        if (labels == lbl).sum() < min_points:
-            labels[labels == lbl] = -1
-
+    labels = _filter_noise(labels, min_points)
     n_valid = len(np.unique(labels[labels != -1]))
-    print(f"DBSCAN gradient-color segments (after noise filter): {n_valid}  "
+    print(f"DBSCAN gradient-color segments: {n_valid}  "
           f"(noise pts: {(labels == -1).sum():,})")
     return labels
 
@@ -355,46 +353,7 @@ def segment_by_dbscan(
 # Export
 # ══════════════════════════════════════════════════════════════════════════════
 
-def save_segments(
-    xyz: np.ndarray,
-    colors: np.ndarray,
-    labels: np.ndarray,
-    output_dir: Path,
-) -> tuple[list[Path], list[int]]:
-    """
-    Write one .ply per gradient-color segment (noise label -1 is skipped).
-
-    File naming: segment_<id>_hue<mean_hue_deg>.ply
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-    saved: list[Path] = []
-    unique_labels = sorted(lbl for lbl in np.unique(labels) if lbl != -1)
-
-    for seg_id, lbl in enumerate(unique_labels):
-        mask       = labels == lbl
-        seg_xyz    = xyz[mask]
-        seg_colors = colors[mask]
-
-        # Compute mean hue for the filename (human-readable)
-        mean_hue_deg = int(np.rad2deg(_mean_hue(seg_colors)) % 360)
-
-        seg_pcd = o3d.geometry.PointCloud()
-        seg_pcd.points = o3d.utility.Vector3dVector(seg_xyz)
-        seg_pcd.colors = o3d.utility.Vector3dVector(seg_colors)
-
-        out_file = output_dir / f"segment_{seg_id:04d}_hue{mean_hue_deg:03d}deg.ply"
-        o3d.io.write_point_cloud(str(out_file), seg_pcd)
-        saved.append(out_file)
-
-    print(f"\nSaved {len(saved)} segment file(s) → '{output_dir.resolve()}'")
-    return saved, unique_labels
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Dimension reporting
-# ══════════════════════════════════════════════════════════════════════════════
-
-# Approximate hue → color name mapping (HSV hue in degrees)
+# Hue name table (degrees)
 _HUE_NAMES = [
     (  0,  15, "red"),
     ( 15,  45, "orange"),
@@ -414,6 +373,40 @@ def _hue_name(hue_deg: float) -> str:
     return "unknown"
 
 
+def save_segments(
+    xyz: np.ndarray,
+    colors: np.ndarray,
+    labels: np.ndarray,
+    output_dir: Path,
+) -> tuple[list[Path], list[int]]:
+    """Write one .ply per gradient-color region. Filename encodes mean hue."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    saved: list[Path] = []
+    unique_labels = sorted(l for l in np.unique(labels) if l != -1)
+
+    for seg_id, lbl in enumerate(unique_labels):
+        mask       = labels == lbl
+        seg_xyz    = xyz[mask]
+        seg_colors = colors[mask]
+        hue_deg    = int(_mean_hue_deg(seg_colors))
+        hue_name   = _hue_name(hue_deg).replace("/", "-")
+
+        seg_pcd = o3d.geometry.PointCloud()
+        seg_pcd.points = o3d.utility.Vector3dVector(seg_xyz)
+        seg_pcd.colors = o3d.utility.Vector3dVector(seg_colors)
+
+        out_file = output_dir / f"segment_{seg_id:04d}_{hue_name}_hue{hue_deg:03d}deg.ply"
+        o3d.io.write_point_cloud(str(out_file), seg_pcd)
+        saved.append(out_file)
+
+    print(f"\nSaved {len(saved)} segment file(s) → '{output_dir.resolve()}'")
+    return saved, unique_labels
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Dimension reporting
+# ══════════════════════════════════════════════════════════════════════════════
+
 def print_dimensions(
     xyz: np.ndarray,
     colors: np.ndarray,
@@ -421,20 +414,13 @@ def print_dimensions(
     unique_labels: list[int],
     saved_paths: list[Path],
 ) -> None:
-    """
-    Print AABB height / width / depth and dominant hue for every segment.
-
-    height : Z-axis extent  (z_max − z_min)
-    width  : X-axis extent  (x_max − x_min)
-    depth  : Y-axis extent  (y_max − y_min)
-    """
-    col_w = 86
+    col_w = 92
     print("\n" + "═" * col_w)
     print(f"  GRADIENT-COLOR SEGMENT DIMENSIONS  ({len(unique_labels)} region(s))")
     print("═" * col_w)
     print(
-        f"{'ID':>4}  {'Hue (name)':>16}  {'Pts':>8}  "
-        f"{'Width(X)':>9}  {'Depth(Y)':>9}  {'Height(Z)':>10}  File"
+        f"{'ID':>4}  {'Color name':>14}  {'Hue':>7}  {'Pts':>8}  "
+        f"{'Width(X)':>9}  {'Depth(Y)':>9}  {'Height(Z)':>10}"
     )
     print("─" * col_w)
 
@@ -447,21 +433,16 @@ def print_dimensions(
         y_min, y_max = float(seg_xyz[:,1].min()), float(seg_xyz[:,1].max())
         z_min, z_max = float(seg_xyz[:,2].min()), float(seg_xyz[:,2].max())
 
-        width  = x_max - x_min
-        depth  = y_max - y_min
-        height = z_max - z_min
-
-        hue_deg  = np.rad2deg(_mean_hue(seg_colors)) % 360
-        hue_str  = f"{hue_deg:5.1f}° ({_hue_name(hue_deg)})"
-
+        hue_deg = _mean_hue_deg(seg_colors)
         print(
-            f"{seg_id:>4}  {hue_str:>16}  {mask.sum():>8,}  "
-            f"{width:>9.4f}  {depth:>9.4f}  {height:>10.4f}  "
-            f"{saved_paths[seg_id].name}"
+            f"{seg_id:>4}  {_hue_name(hue_deg):>14}  {hue_deg:>6.1f}°  "
+            f"{mask.sum():>8,}  "
+            f"{x_max-x_min:>9.4f}  {y_max-y_min:>9.4f}  {z_max-z_min:>10.4f}"
         )
+        print(f"      ↳ {saved_paths[seg_id].name}")
 
     print("═" * col_w)
-    print("  Units match the coordinate units of the input point cloud.")
+    print("  height=Z-extent · width=X-extent · depth=Y-extent")
     print("═" * col_w)
 
 
@@ -472,14 +453,18 @@ def print_dimensions(
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
-            "Export gradient-color regions from a Utonia PCA-colored point cloud.\n"
-            "Segments are recovered by clustering in HSV hue space — the same\n"
-            "color space that get_pca_color() in app.py produces.\n\n"
-            "Examples:\n"
+            "Extract gradient-color regions from a Utonia PCA-colored point cloud.\n"
+            "Uses a soft hue-histogram feature to separate adjacent hues\n"
+            "(yellow vs orange, cyan vs green, etc.).\n\n"
+            "Quick start:\n"
             "  python utonia_segment_exporter.py --input scene.ply\n"
-            "  python utonia_segment_exporter.py --input scene.ply --n_segments 8\n"
-            "  python utonia_segment_exporter.py --input scene.ply --method dbscan --eps 0.1\n"
-            "  python utonia_segment_exporter.py --input scene.ply --merge_deg 15\n"
+            "  python utonia_segment_exporter.py --input scene.ply --n_segments 10\n"
+            "  python utonia_segment_exporter.py --input scene.ply --method dbscan --eps 0.25\n"
+            "  python utonia_segment_exporter.py --input scene.ply --merge_deg 12\n"
+            "\nTuning tips:\n"
+            "  --hue_bins 72       finer bins (5°/bin) for very similar colors\n"
+            "  --hue_sigma 5       narrower Gaussians for sharper separation\n"
+            "  --hue_weight 5      emphasise hue over brightness even more\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -493,22 +478,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # K-Means
     p.add_argument("--n_segments", "-k", type=int, default=DEFAULT_N_SEGMENTS,
-                   help="[K-Means] Number of gradient-color segments K. "
-                        "Auto-estimated if omitted.")
-
+                   help="[K-Means] K — auto-estimated if omitted.")
     # DBSCAN
     p.add_argument("--eps", "-e", type=float, default=DEFAULT_DBSCAN_EPS,
-                   help="[DBSCAN] Neighborhood radius in HSV feature space.")
+                   help="[DBSCAN] Neighborhood radius in soft-hue feature space.")
     p.add_argument("--min_pts", type=int, default=DEFAULT_DBSCAN_MIN_PTS,
-                   help="[DBSCAN] min_samples parameter.")
+                   help="[DBSCAN] min_samples.")
+
+    # Hue feature knobs
+    p.add_argument("--hue_bins", type=int, default=DEFAULT_HUE_BINS,
+                   help=f"Number of soft hue bins (default {DEFAULT_HUE_BINS} → 10°/bin). "
+                        "Increase to 72 for 5°/bin when yellow/orange still blend.")
+    p.add_argument("--hue_sigma", type=float, default=DEFAULT_HUE_SIGMA_DEG,
+                   help=f"Gaussian σ per hue bin in degrees (default {DEFAULT_HUE_SIGMA_DEG}). "
+                        "Decrease for sharper hue separation.")
+    p.add_argument("--hue_weight", type=float, default=DEFAULT_HUE_WEIGHT,
+                   help=f"Scale factor for hue channels vs S/V (default {DEFAULT_HUE_WEIGHT}). "
+                        "Increase to make hue dominate over brightness.")
 
     # Common
     p.add_argument("--min_points", "-m", type=int, default=DEFAULT_MIN_POINTS,
-                   help="Min points per segment; smaller clusters = noise.")
+                   help="Min points per segment; smaller → noise.")
     p.add_argument("--merge_deg", type=float, default=DEFAULT_MERGE_DEG,
-                   help="Merge clusters whose mean hue differs by less than "
-                        "this many degrees (0 = no merging). "
-                        "E.g. --merge_deg 20 collapses near-pink and pink together.")
+                   help="Post-merge clusters within this hue distance (degrees). "
+                        "0 = no merging.")
     return p
 
 
@@ -522,29 +515,34 @@ def main() -> None:
     # 1. Load
     xyz, colors = load_pointcloud(input_path)
 
-    # 2. Cluster by gradient-color region (HSV hue space)
+    # 2. Cluster in soft-hue-histogram feature space
     if args.method == "kmeans":
-        labels = segment_by_kmeans(colors, args.n_segments, args.min_points)
+        labels = segment_by_kmeans(
+            colors, args.n_segments, args.min_points,
+            args.hue_bins, args.hue_sigma, args.hue_weight,
+        )
     else:
-        labels = segment_by_dbscan(colors, args.eps, args.min_pts, args.min_points)
+        labels = segment_by_dbscan(
+            colors, args.eps, args.min_pts, args.min_points,
+            args.hue_bins, args.hue_sigma, args.hue_weight,
+        )
 
-    # 3. Optionally merge clusters with similar hues
+    # 3. Optional: merge near-hue clusters
     if args.merge_deg > 0:
         labels = merge_close_hue_clusters(labels, colors, args.merge_deg)
 
-    n_valid = len(np.unique(labels[labels != -1]))
-    if n_valid == 0:
+    if len(np.unique(labels[labels != -1])) == 0:
         sys.exit(
             "No valid segments found.\n"
-            "  • K-Means : try a different --n_segments value.\n"
-            "  • DBSCAN  : try a smaller --eps or --min_pts value.\n"
-            "  • Both    : try lowering --min_points."
+            "  K-Means : try a different --n_segments\n"
+            "  DBSCAN  : try a smaller --eps or --min_pts\n"
+            "  Both    : try lowering --min_points"
         )
 
-    # 4. Save — one .ply per gradient-color region
+    # 4. Save
     saved_paths, unique_labels = save_segments(xyz, colors, labels, Path(args.output_dir))
 
-    # 5. Print dimension table with hue names
+    # 5. Report
     print_dimensions(xyz, colors, labels, unique_labels, saved_paths)
 
 
