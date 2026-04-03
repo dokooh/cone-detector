@@ -28,6 +28,11 @@ Clustering pipeline
 3. K-Means (default, fast) or DBSCAN (no-K fallback) on that feature.
 4. Optional: merge any two clusters whose mean hue differs < --merge_deg.
 5. Save one .ply per cluster, print AABB dimensions.
+6. Post-process each saved .ply:
+     a. Statistical outlier removal (SOR).
+     b. Extract the largest connected component (radius neighbour graph).
+     c. Overwrite the file with the cleaned result.
+     d. Re-print dimensions of the cleaned clouds.
 
 Usage
 -----
@@ -42,6 +47,10 @@ Usage
 
     # Merge clusters whose hues are within 15 degrees of each other:
     python utonia_segment_exporter.py --input scene_pca.ply --merge_deg 15
+
+    # Tune post-processing:
+    python utonia_segment_exporter.py --input scene_pca.ply \\
+        --sor_neighbors 30 --sor_std_ratio 1.5 --cc_radius 0.05
 
 Requirements
 ------------
@@ -79,8 +88,13 @@ DEFAULT_DBSCAN_MIN_PTS = 50
 DEFAULT_MIN_POINTS     = 10     # clusters smaller than this = noise
 DEFAULT_MERGE_DEG      = 0.0    # 0 = no merging
 
+# Post-processing defaults
+DEFAULT_SOR_NEIGHBORS  = 20     # Statistical Outlier Removal: kNN neighbours
+DEFAULT_SOR_STD_RATIO  = 2.0    # Statistical Outlier Removal: std-dev multiplier
+DEFAULT_CC_RADIUS      = 0.05   # Connected-component graph edge radius (scene units)
 
-# ══════════════════════���═══════════════════════════════════════════════════════
+
+# ═════════════════════════════════════════════════════��════════════════════════
 # I/O
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -420,6 +434,7 @@ def print_dimensions(
     labels: np.ndarray,
     unique_labels: list[int],
     saved_paths: list[Path],
+    header: str = "GRADIENT-COLOR SEGMENT DIMENSIONS",
 ) -> None:
     """
     Print AABB height / width / depth and dominant hue for every segment.
@@ -430,7 +445,7 @@ def print_dimensions(
     """
     col_w = 86
     print("\n" + "═" * col_w)
-    print(f"  GRADIENT-COLOR SEGMENT DIMENSIONS  ({len(unique_labels)} region(s))")
+    print(f"  {header}  ({len(unique_labels)} region(s))")
     print("═" * col_w)
     print(
         f"{'ID':>4}  {'Hue (name)':>16}  {'Pts':>8}  "
@@ -466,6 +481,188 @@ def print_dimensions(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Step 6 — Post-processing: outlier removal + largest connected component
+# ══════════════════════════════════════════════════════════════════════════════
+
+def remove_outliers(
+    pcd: o3d.geometry.PointCloud,
+    nb_neighbors: int,
+    std_ratio: float,
+) -> tuple[o3d.geometry.PointCloud, int]:
+    """
+    Statistical Outlier Removal (SOR).
+
+    For every point the mean distance to its `nb_neighbors` nearest
+    neighbours is computed.  Points whose mean distance exceeds
+    (global_mean + std_ratio * global_std) are removed.
+
+    Parameters
+    ----------
+    pcd          : input point cloud
+    nb_neighbors : number of neighbours to consider per point
+    std_ratio    : standard-deviation multiplier for the threshold
+
+    Returns
+    -------
+    clean_pcd    : inlier point cloud
+    n_removed    : number of points removed
+    """
+    n_before = len(pcd.points)
+    clean_pcd, _ = pcd.remove_statistical_outlier(
+        nb_neighbors=nb_neighbors,
+        std_ratio=std_ratio,
+    )
+    n_removed = n_before - len(clean_pcd.points)
+    return clean_pcd, n_removed
+
+
+def largest_connected_component(
+    pcd: o3d.geometry.PointCloud,
+    radius: float,
+    min_points: int,
+) -> tuple[o3d.geometry.PointCloud, int, int]:
+    """
+    Extract the largest connected component from a point cloud using a
+    radius-based neighbour graph.
+
+    Algorithm
+    ---------
+    Open3D's ``cluster_dbscan`` with ``eps=radius`` and
+    ``min_points=1`` groups every point that is within *radius* of at
+    least one other point in the same component — this is equivalent to
+    single-linkage / connected-components on a radius graph and requires
+    **no prior knowledge of K**.
+
+    The label with the highest point count (excluding noise label -1) is
+    kept.  If the winning component has fewer than *min_points* the
+    function returns the original cloud unchanged and emits a warning.
+
+    Parameters
+    ----------
+    pcd        : input point cloud (after outlier removal)
+    radius     : edge-connection radius in scene units (same as --cc_radius)
+    min_points : if the largest component is smaller than this, skip filtering
+
+    Returns
+    -------
+    largest_pcd  : point cloud of the largest connected component
+    n_kept       : number of points kept
+    n_components : total number of components found (noise excluded)
+    """
+    if len(pcd.points) == 0:
+        return pcd, 0, 0
+
+    # cluster_dbscan with min_points=1 → every point belongs to some
+    # cluster; the labelling is equivalent to connected components on the
+    # radius graph.
+    cc_labels = np.asarray(
+        pcd.cluster_dbscan(eps=radius, min_points=1, print_progress=False)
+    )
+
+    unique_cc, counts = np.unique(cc_labels[cc_labels >= 0], return_counts=True)
+    n_components = len(unique_cc)
+
+    if n_components == 0:
+        # All points were noise (shouldn't happen with min_points=1 unless
+        # the cloud is a single isolated point)
+        return pcd, len(pcd.points), 0
+
+    best_label = unique_cc[np.argmax(counts)]
+    best_count = counts[np.argmax(counts)]
+
+    if best_count < min_points:
+        print(
+            f"    ⚠  Largest component has only {best_count} pts "
+            f"(< min_points={min_points}); skipping CC extraction."
+        )
+        return pcd, len(pcd.points), n_components
+
+    mask        = cc_labels == best_label
+    largest_pcd = pcd.select_by_index(np.where(mask)[0])
+    return largest_pcd, int(best_count), n_components
+
+
+def postprocess_segments(
+    saved_paths: list[Path],
+    sor_neighbors: int,
+    sor_std_ratio: float,
+    cc_radius: float,
+    min_points: int,
+) -> tuple[list[np.ndarray], list[np.ndarray], list[int]]:
+    """
+    For every saved segment .ply file (Step 5 output):
+      1. Load it.
+      2. Statistical Outlier Removal.
+      3. Extract the largest connected component (radius graph CC).
+      4. Overwrite the file with the cleaned result.
+
+    Returns arrays suitable for re-running ``print_dimensions``:
+      all_xyz    : list of (M_i, 3) XYZ arrays
+      all_colors : list of (M_i, 3) color arrays
+      new_labels : flat label array (0 … N-1), one per point
+                   (recycled from segment index so print_dimensions works)
+    """
+    col_w = 86
+    print("\n" + "═" * col_w)
+    print("  STEP 6 — POST-PROCESSING: OUTLIER REMOVAL + LARGEST CONNECTED COMPONENT")
+    print("═" * col_w)
+    print(
+        f"  SOR  : nb_neighbors={sor_neighbors}, std_ratio={sor_std_ratio}\n"
+        f"  CC   : radius={cc_radius}, min_points={min_points}"
+    )
+    print("─" * col_w)
+    print(
+        f"{'ID':>4}  {'File':<45}  {'Before':>8}  "
+        f"{'−Outliers':>10}  {'−CC noise':>10}  {'After':>8}"
+    )
+    print("─" * col_w)
+
+    all_xyz: list[np.ndarray]    = []
+    all_colors: list[np.ndarray] = []
+
+    for seg_id, ply_path in enumerate(saved_paths):
+        pcd = o3d.io.read_point_cloud(str(ply_path))
+        n_before = len(pcd.points)
+
+        # ── 1. Statistical Outlier Removal ───────────────────────────────────
+        pcd_sor, n_sor_removed = remove_outliers(pcd, sor_neighbors, sor_std_ratio)
+        n_after_sor = len(pcd_sor.points)
+
+        # ── 2. Largest Connected Component ───────────────────────────────────
+        pcd_cc, n_kept, n_components = largest_connected_component(
+            pcd_sor, cc_radius, min_points
+        )
+        n_cc_removed = n_after_sor - n_kept
+
+        # ── 3. Overwrite the .ply file ────────────────────────────────────────
+        o3d.io.write_point_cloud(str(ply_path), pcd_cc)
+
+        # ── 4. Collect arrays for dimension re-printing ───────────────────────
+        xyz_clean    = np.asarray(pcd_cc.points, dtype=np.float64)
+        colors_clean = np.asarray(pcd_cc.colors, dtype=np.float64)
+        all_xyz.append(xyz_clean)
+        all_colors.append(colors_clean)
+
+        print(
+            f"{seg_id:>4}  {ply_path.name:<45}  {n_before:>8,}  "
+            f"{n_sor_removed:>10,}  {n_cc_removed:>10,}  {n_kept:>8,}"
+            + (f"  [{n_components} CC(s)]" if n_components > 1 else "")
+        )
+
+    print("═" * col_w)
+    print(f"  Cleaned files overwritten in place.\n")
+
+    # Build a flat label array (0 … len(saved_paths)-1) for print_dimensions
+    combined_xyz    = np.concatenate(all_xyz,    axis=0)
+    combined_colors = np.concatenate(all_colors, axis=0)
+    flat_labels     = np.concatenate(
+        [np.full(len(x), i, dtype=np.int32) for i, x in enumerate(all_xyz)]
+    )
+
+    return combined_xyz, combined_colors, flat_labels
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # CLI
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -480,6 +677,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "  python utonia_segment_exporter.py --input scene.ply --n_segments 8\n"
             "  python utonia_segment_exporter.py --input scene.ply --method dbscan --eps 0.1\n"
             "  python utonia_segment_exporter.py --input scene.ply --merge_deg 15\n"
+            "  python utonia_segment_exporter.py --input scene.ply \\\n"
+            "      --sor_neighbors 30 --sor_std_ratio 1.5 --cc_radius 0.05\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -509,6 +708,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Merge clusters whose mean hue differs by less than "
                         "this many degrees (0 = no merging). "
                         "E.g. --merge_deg 20 collapses near-pink and pink together.")
+
+    # ── Post-processing (Step 6) ──────────────────────────────────────────────
+    post = p.add_argument_group("post-processing (Step 6)")
+    post.add_argument("--sor_neighbors", type=int, default=DEFAULT_SOR_NEIGHBORS,
+                      help="[SOR] Number of nearest neighbours for statistical "
+                           "outlier removal (default: %(default)s).")
+    post.add_argument("--sor_std_ratio", type=float, default=DEFAULT_SOR_STD_RATIO,
+                      help="[SOR] Std-dev multiplier: points beyond "
+                           "mean + ratio*std are removed (default: %(default)s). "
+                           "Lower = more aggressive.")
+    post.add_argument("--cc_radius", type=float, default=DEFAULT_CC_RADIUS,
+                      help="[CC] Edge-connection radius for the spatial neighbour "
+                           "graph used to find connected components "
+                           "(scene units, default: %(default)s). "
+                           "Increase for sparser clouds.")
     return p
 
 
@@ -544,8 +758,26 @@ def main() -> None:
     # 4. Save — one .ply per gradient-color region
     saved_paths, unique_labels = save_segments(xyz, colors, labels, Path(args.output_dir))
 
-    # 5. Print dimension table with hue names
-    print_dimensions(xyz, colors, labels, unique_labels, saved_paths)
+    # 5. Print dimension table with hue names (raw, pre-cleaning)
+    print_dimensions(xyz, colors, labels, unique_labels, saved_paths,
+                     header="RAW SEGMENT DIMENSIONS (before post-processing)")
+
+    # 6. Post-process: outlier removal + largest connected component
+    clean_xyz, clean_colors, clean_labels = postprocess_segments(
+        saved_paths,
+        sor_neighbors=args.sor_neighbors,
+        sor_std_ratio=args.sor_std_ratio,
+        cc_radius=args.cc_radius,
+        min_points=args.min_points,
+    )
+
+    # 7. Re-print dimensions of the cleaned segments
+    clean_unique = sorted(set(clean_labels))
+    print_dimensions(
+        clean_xyz, clean_colors, clean_labels,
+        clean_unique, saved_paths,
+        header="CLEANED SEGMENT DIMENSIONS (after outlier removal + CC extraction)",
+    )
 
 
 if __name__ == "__main__":
