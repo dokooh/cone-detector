@@ -33,6 +33,9 @@ Clustering pipeline
      b. Extract the largest connected component (radius neighbour graph).
      c. Overwrite the file with the cleaned result.
      d. Re-print dimensions of the cleaned clouds.
+7. Reload each cleaned .ply, compute AABB height/length/width, print a
+   formatted table, and save all measurements to segments_dimensions.json
+   inside the output directory.
 
 Usage
 -----
@@ -60,6 +63,7 @@ Requirements
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -93,8 +97,11 @@ DEFAULT_SOR_NEIGHBORS  = 20     # Statistical Outlier Removal: kNN neighbours
 DEFAULT_SOR_STD_RATIO  = 2.0    # Statistical Outlier Removal: std-dev multiplier
 DEFAULT_CC_RADIUS      = 0.05   # Connected-component graph edge radius (scene units)
 
+# Dimension JSON filename
+DIMENSIONS_JSON        = "segments_dimensions.json"
 
-# ═════════════════════════════════════════════════════��════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
 # I/O
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -140,14 +147,13 @@ def rgb_to_hsv(colors: np.ndarray) -> np.ndarray:
     """
     r, g, b = colors[:, 0], colors[:, 1], colors[:, 2]
 
-    v   = np.maximum.reduce([r, g, b])          # value
+    v   = np.maximum.reduce([r, g, b])
     s   = np.where(v > 1e-8,
                    (v - np.minimum.reduce([r, g, b])) / np.clip(v, 1e-8, None),
-                   0.0)                          # saturation
+                   0.0)
 
     diff = np.clip(v - np.minimum.reduce([r, g, b]), 1e-8, None)
 
-    # Hue in [0, 6)
     h = np.where(
         v == r, (g - b) / diff % 6,
         np.where(
@@ -157,7 +163,7 @@ def rgb_to_hsv(colors: np.ndarray) -> np.ndarray:
     )
     h = h / 6.0 * 2.0 * np.pi   # → radians [0, 2π)
 
-    return np.stack([h, s, v], axis=-1)          # (N, 3)
+    return np.stack([h, s, v], axis=-1)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -166,32 +172,15 @@ def rgb_to_hsv(colors: np.ndarray) -> np.ndarray:
 
 def build_hsv_features(colors: np.ndarray, hsv_weight: float = 1.0) -> np.ndarray:
     """
-    Build a clustering feature that captures gradient-color regions.
-
     Feature = [cos(H)*S,  sin(H)*S,  V]
-
-    • (cos H * S, sin H * S)  encodes hue circularly, weighted by
-      saturation so that near-grey points (S≈0, hue undefined) don't
-      pollute hue-based clusters.
-    • V (brightness) is included to separate dark from bright regions.
-
-    Parameters
-    ----------
-    colors     : (N, 3) float64 RGB in [0, 1]
-    hsv_weight : scale for the hue/saturation channels (default 1.0)
-
-    Returns
-    -------
-    features : (N, 3) float64
     """
     hsv = rgb_to_hsv(colors)
     h, s, v = hsv[:, 0], hsv[:, 1], hsv[:, 2]
 
     cos_h = np.cos(h) * s * hsv_weight
     sin_h = np.sin(h) * s * hsv_weight
-    val   = v
 
-    return np.stack([cos_h, sin_h, val], axis=-1)   # (N, 3)
+    return np.stack([cos_h, sin_h, v], axis=-1)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -210,20 +199,6 @@ def merge_close_hue_clusters(
     colors: np.ndarray,
     merge_deg: float,
 ) -> np.ndarray:
-    """
-    Merge any two clusters whose circular mean hue difference is less
-    than `merge_deg` degrees.  Uses greedy single-linkage on hue distance.
-
-    Parameters
-    ----------
-    labels    : (N,) int — cluster labels (-1 = noise)
-    colors    : (N, 3) float64 RGB in [0, 1]
-    merge_deg : angular threshold in degrees
-
-    Returns
-    -------
-    new_labels : (N,) int — merged labels
-    """
     if merge_deg <= 0:
         return labels
 
@@ -231,7 +206,6 @@ def merge_close_hue_clusters(
     unique = [lbl for lbl in np.unique(labels) if lbl != -1]
     mean_hues = {lbl: _mean_hue(colors[labels == lbl]) for lbl in unique}
 
-    # Union-Find
     parent = {lbl: lbl for lbl in unique}
 
     def find(x):
@@ -246,11 +220,10 @@ def merge_close_hue_clusters(
     for i, la in enumerate(unique):
         for lb in unique[i + 1:]:
             diff = abs(mean_hues[la] - mean_hues[lb])
-            diff = min(diff, 2 * np.pi - diff)   # circular distance
+            diff = min(diff, 2 * np.pi - diff)
             if diff < merge_rad:
                 union(la, lb)
 
-    # Re-map labels through union-find
     root_to_new: dict[int, int] = {}
     new_id = 0
     new_labels = labels.copy()
@@ -274,7 +247,6 @@ def merge_close_hue_clusters(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _estimate_k(features: np.ndarray, k_min: int = 2, k_max: int = 20) -> int:
-    """Estimate K via the elbow method on a 50 k-point sub-sample."""
     rng     = np.random.default_rng(42)
     idx     = rng.choice(len(features), size=min(50_000, len(features)), replace=False)
     sample  = features[idx]
@@ -297,19 +269,6 @@ def segment_by_kmeans(
     n_segments: int | None = None,
     min_points: int = DEFAULT_MIN_POINTS,
 ) -> np.ndarray:
-    """
-    Cluster gradient-color regions with K-Means in HSV feature space.
-
-    Parameters
-    ----------
-    colors     : (N, 3) float64 RGB in [0, 1]
-    n_segments : K; auto-estimated if None
-    min_points : clusters smaller than this become noise (-1)
-
-    Returns
-    -------
-    labels : (N,) int
-    """
     features = build_hsv_features(colors)
     k = n_segments if n_segments is not None else _estimate_k(features)
 
@@ -317,7 +276,6 @@ def segment_by_kmeans(
     km     = KMeans(n_clusters=k, n_init=10, random_state=42, max_iter=300)
     labels = km.fit_predict(features).astype(np.int32)
 
-    # Mark tiny clusters as noise
     for lbl in np.unique(labels):
         if (labels == lbl).sum() < min_points:
             labels[labels == lbl] = -1
@@ -333,20 +291,6 @@ def segment_by_dbscan(
     min_pts: int = DEFAULT_DBSCAN_MIN_PTS,
     min_points: int = DEFAULT_MIN_POINTS,
 ) -> np.ndarray:
-    """
-    Cluster gradient-color regions with DBSCAN in HSV feature space.
-
-    Parameters
-    ----------
-    colors     : (N, 3) float64 RGB in [0, 1]
-    eps        : neighborhood radius in HSV feature space
-    min_pts    : DBSCAN min_samples
-    min_points : clusters smaller than this become noise (-1)
-
-    Returns
-    -------
-    labels : (N,) int
-    """
     features = build_hsv_features(colors)
 
     print(f"Running DBSCAN (eps={eps}, min_samples={min_pts}) in HSV feature space …")
@@ -375,11 +319,7 @@ def save_segments(
     labels: np.ndarray,
     output_dir: Path,
 ) -> tuple[list[Path], list[int]]:
-    """
-    Write one .ply per gradient-color segment (noise label -1 is skipped).
-
-    File naming: segment_<id>_hue<mean_hue_deg>.ply
-    """
+    """Write one .ply per gradient-color segment."""
     output_dir.mkdir(parents=True, exist_ok=True)
     saved: list[Path] = []
     unique_labels = sorted(lbl for lbl in np.unique(labels) if lbl != -1)
@@ -389,7 +329,6 @@ def save_segments(
         seg_xyz    = xyz[mask]
         seg_colors = colors[mask]
 
-        # Compute mean hue for the filename (human-readable)
         mean_hue_deg = int(np.rad2deg(_mean_hue(seg_colors)) % 360)
 
         seg_pcd = o3d.geometry.PointCloud()
@@ -405,10 +344,9 @@ def save_segments(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Dimension reporting
+# Dimension reporting helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Approximate hue → color name mapping (HSV hue in degrees)
 _HUE_NAMES = [
     (  0,  15, "red"),
     ( 15,  45, "orange"),
@@ -436,13 +374,7 @@ def print_dimensions(
     saved_paths: list[Path],
     header: str = "GRADIENT-COLOR SEGMENT DIMENSIONS",
 ) -> None:
-    """
-    Print AABB height / width / depth and dominant hue for every segment.
-
-    height : Z-axis extent  (z_max − z_min)
-    width  : X-axis extent  (x_max − x_min)
-    depth  : Y-axis extent  (y_max − y_min)
-    """
+    """Print AABB height / width / depth for every segment."""
     col_w = 86
     print("\n" + "═" * col_w)
     print(f"  {header}  ({len(unique_labels)} region(s))")
@@ -480,7 +412,7 @@ def print_dimensions(
     print("═" * col_w)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════���════════════════════════════════════════════════════════
 # Step 6 — Post-processing: outlier removal + largest connected component
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -492,28 +424,14 @@ def remove_outliers(
     """
     Statistical Outlier Removal (SOR).
 
-    For every point the mean distance to its `nb_neighbors` nearest
-    neighbours is computed.  Points whose mean distance exceeds
-    (global_mean + std_ratio * global_std) are removed.
-
-    Parameters
-    ----------
-    pcd          : input point cloud
-    nb_neighbors : number of neighbours to consider per point
-    std_ratio    : standard-deviation multiplier for the threshold
-
-    Returns
-    -------
-    clean_pcd    : inlier point cloud
-    n_removed    : number of points removed
+    Returns the inlier cloud and the number of removed points.
     """
     n_before = len(pcd.points)
     clean_pcd, _ = pcd.remove_statistical_outlier(
         nb_neighbors=nb_neighbors,
         std_ratio=std_ratio,
     )
-    n_removed = n_before - len(clean_pcd.points)
-    return clean_pcd, n_removed
+    return clean_pcd, n_before - len(clean_pcd.points)
 
 
 def largest_connected_component(
@@ -522,39 +440,16 @@ def largest_connected_component(
     min_points: int,
 ) -> tuple[o3d.geometry.PointCloud, int, int]:
     """
-    Extract the largest connected component from a point cloud using a
-    radius-based neighbour graph.
+    Extract the largest connected component via a radius neighbour graph.
 
-    Algorithm
-    ---------
-    Open3D's ``cluster_dbscan`` with ``eps=radius`` and
-    ``min_points=1`` groups every point that is within *radius* of at
-    least one other point in the same component — this is equivalent to
-    single-linkage / connected-components on a radius graph and requires
-    **no prior knowledge of K**.
+    Uses cluster_dbscan(min_points=1) which is equivalent to single-linkage
+    connected-components — no K required.
 
-    The label with the highest point count (excluding noise label -1) is
-    kept.  If the winning component has fewer than *min_points* the
-    function returns the original cloud unchanged and emits a warning.
-
-    Parameters
-    ----------
-    pcd        : input point cloud (after outlier removal)
-    radius     : edge-connection radius in scene units (same as --cc_radius)
-    min_points : if the largest component is smaller than this, skip filtering
-
-    Returns
-    -------
-    largest_pcd  : point cloud of the largest connected component
-    n_kept       : number of points kept
-    n_components : total number of components found (noise excluded)
+    Returns (largest_pcd, n_points_kept, n_components_found).
     """
     if len(pcd.points) == 0:
         return pcd, 0, 0
 
-    # cluster_dbscan with min_points=1 → every point belongs to some
-    # cluster; the labelling is equivalent to connected components on the
-    # radius graph.
     cc_labels = np.asarray(
         pcd.cluster_dbscan(eps=radius, min_points=1, print_progress=False)
     )
@@ -563,12 +458,10 @@ def largest_connected_component(
     n_components = len(unique_cc)
 
     if n_components == 0:
-        # All points were noise (shouldn't happen with min_points=1 unless
-        # the cloud is a single isolated point)
         return pcd, len(pcd.points), 0
 
     best_label = unique_cc[np.argmax(counts)]
-    best_count = counts[np.argmax(counts)]
+    best_count = int(counts[np.argmax(counts)])
 
     if best_count < min_points:
         print(
@@ -579,7 +472,7 @@ def largest_connected_component(
 
     mask        = cc_labels == best_label
     largest_pcd = pcd.select_by_index(np.where(mask)[0])
-    return largest_pcd, int(best_count), n_components
+    return largest_pcd, best_count, n_components
 
 
 def postprocess_segments(
@@ -588,19 +481,16 @@ def postprocess_segments(
     sor_std_ratio: float,
     cc_radius: float,
     min_points: int,
-) -> tuple[list[np.ndarray], list[np.ndarray], list[int]]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    For every saved segment .ply file (Step 5 output):
+    Step 6: for every saved segment .ply —
       1. Load it.
       2. Statistical Outlier Removal.
-      3. Extract the largest connected component (radius graph CC).
-      4. Overwrite the file with the cleaned result.
+      3. Largest connected component.
+      4. Overwrite the file.
 
-    Returns arrays suitable for re-running ``print_dimensions``:
-      all_xyz    : list of (M_i, 3) XYZ arrays
-      all_colors : list of (M_i, 3) color arrays
-      new_labels : flat label array (0 … N-1), one per point
-                   (recycled from segment index so print_dimensions works)
+    Returns (combined_xyz, combined_colors, flat_labels) ready for
+    print_dimensions and measure_and_save_dimensions.
     """
     col_w = 86
     print("\n" + "═" * col_w)
@@ -621,23 +511,19 @@ def postprocess_segments(
     all_colors: list[np.ndarray] = []
 
     for seg_id, ply_path in enumerate(saved_paths):
-        pcd = o3d.io.read_point_cloud(str(ply_path))
+        pcd      = o3d.io.read_point_cloud(str(ply_path))
         n_before = len(pcd.points)
 
-        # ── 1. Statistical Outlier Removal ───────────────────────────────────
         pcd_sor, n_sor_removed = remove_outliers(pcd, sor_neighbors, sor_std_ratio)
         n_after_sor = len(pcd_sor.points)
 
-        # ── 2. Largest Connected Component ───────────────────────────────────
         pcd_cc, n_kept, n_components = largest_connected_component(
             pcd_sor, cc_radius, min_points
         )
         n_cc_removed = n_after_sor - n_kept
 
-        # ── 3. Overwrite the .ply file ────────────────────────────────────────
         o3d.io.write_point_cloud(str(ply_path), pcd_cc)
 
-        # ── 4. Collect arrays for dimension re-printing ───────────────────────
         xyz_clean    = np.asarray(pcd_cc.points, dtype=np.float64)
         colors_clean = np.asarray(pcd_cc.colors, dtype=np.float64)
         all_xyz.append(xyz_clean)
@@ -650,16 +536,157 @@ def postprocess_segments(
         )
 
     print("═" * col_w)
-    print(f"  Cleaned files overwritten in place.\n")
+    print("  Cleaned files overwritten in place.\n")
 
-    # Build a flat label array (0 … len(saved_paths)-1) for print_dimensions
     combined_xyz    = np.concatenate(all_xyz,    axis=0)
     combined_colors = np.concatenate(all_colors, axis=0)
     flat_labels     = np.concatenate(
         [np.full(len(x), i, dtype=np.int32) for i, x in enumerate(all_xyz)]
     )
-
     return combined_xyz, combined_colors, flat_labels
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Step 7 — Measure & save dimensions from the final cleaned .ply files
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _aabb_dims(xyz: np.ndarray) -> dict[str, float]:
+    """
+    Compute axis-aligned bounding-box dimensions from an (N,3) array.
+
+    Convention (matches the most common point-cloud coordinate frame):
+      length : X-axis extent  (x_max − x_min)
+      width  : Y-axis extent  (y_max − y_min)
+      height : Z-axis extent  (z_max − z_min)
+
+    Also stores the min/max corners so callers can reconstruct the box.
+    """
+    x_min, x_max = float(xyz[:, 0].min()), float(xyz[:, 0].max())
+    y_min, y_max = float(xyz[:, 1].min()), float(xyz[:, 1].max())
+    z_min, z_max = float(xyz[:, 2].min()), float(xyz[:, 2].max())
+    return {
+        "length_x": round(x_max - x_min, 6),
+        "width_y":  round(y_max - y_min, 6),
+        "height_z": round(z_max - z_min, 6),
+        "x_min": round(x_min, 6), "x_max": round(x_max, 6),
+        "y_min": round(y_min, 6), "y_max": round(y_max, 6),
+        "z_min": round(z_min, 6), "z_max": round(z_max, 6),
+    }
+
+
+def measure_and_save_dimensions(
+    saved_paths: list[Path],
+    output_dir: Path,
+    source_file: str,
+) -> Path:
+    """
+    Step 7: reload every cleaned .ply, compute AABB dimensions, print a
+    formatted table, and write all results to DIMENSIONS_JSON.
+
+    Parameters
+    ----------
+    saved_paths : paths to the cleaned segment .ply files (Step 6 output)
+    output_dir  : directory where the JSON will be written
+    source_file : name of the original input .ply (stored in JSON metadata)
+
+    Returns
+    -------
+    json_path : path to the written JSON file
+    """
+    col_w = 96
+    print("\n" + "═" * col_w)
+    print("  STEP 7 — FINAL DIMENSIONS (cleaned point clouds)")
+    print("═" * col_w)
+    print(
+        f"  Axis convention:  Length = X extent  │  Width = Y extent  │  Height = Z extent\n"
+        f"  Units: same coordinate units as the input point cloud."
+    )
+    print("─" * col_w)
+    print(
+        f"{'ID':>4}  {'File':<48}  {'Pts':>8}  "
+        f"{'Length(X)':>10}  {'Width(Y)':>10}  {'Height(Z)':>10}  {'Hue':>12}"
+    )
+    print("─" * col_w)
+
+    records: list[dict] = []
+
+    for seg_id, ply_path in enumerate(saved_paths):
+        # ── Load cleaned file ─────────────────────────────────────────────────
+        pcd = o3d.io.read_point_cloud(str(ply_path))
+        if len(pcd.points) == 0:
+            print(f"{seg_id:>4}  {ply_path.name:<48}  {'EMPTY — skipped':>8}")
+            records.append({
+                "segment_id":   seg_id,
+                "file":         ply_path.name,
+                "n_points":     0,
+                "hue_deg":      None,
+                "hue_name":     None,
+                "length_x":     None,
+                "width_y":      None,
+                "height_z":     None,
+                "aabb":         None,
+            })
+            continue
+
+        xyz    = np.asarray(pcd.points, dtype=np.float64)
+        colors = np.asarray(pcd.colors, dtype=np.float64)
+
+        # ── AABB ──────────────────────────────────────────────────────────────
+        dims = _aabb_dims(xyz)
+
+        # ── Hue ───────────────────────────────────────────────────────────────
+        hue_deg  = round(float(np.rad2deg(_mean_hue(colors)) % 360), 2)
+        hue_str  = f"{hue_deg:5.1f}° {_hue_name(hue_deg)}"
+
+        # ── Print row ─────────────────────────────────────────────────────────
+        print(
+            f"{seg_id:>4}  {ply_path.name:<48}  {len(xyz):>8,}  "
+            f"{dims['length_x']:>10.4f}  {dims['width_y']:>10.4f}  "
+            f"{dims['height_z']:>10.4f}  {hue_str:>12}"
+        )
+
+        # ── Accumulate record ─────────────────────────────────────────────────
+        records.append({
+            "segment_id": seg_id,
+            "file":       ply_path.name,
+            "n_points":   int(len(xyz)),
+            "hue_deg":    hue_deg,
+            "hue_name":   _hue_name(hue_deg),
+            "length_x":   dims["length_x"],
+            "width_y":    dims["width_y"],
+            "height_z":   dims["height_z"],
+            "aabb": {
+                "x_min": dims["x_min"], "x_max": dims["x_max"],
+                "y_min": dims["y_min"], "y_max": dims["y_max"],
+                "z_min": dims["z_min"], "z_max": dims["z_max"],
+            },
+        })
+
+    print("═" * col_w)
+
+    # ── Build JSON payload ────────────────────────────────────────────────────
+    payload = {
+        "metadata": {
+            "source_file":    source_file,
+            "n_segments":     len(records),
+            "axis_convention": {
+                "length": "X-axis extent (x_max - x_min)",
+                "width":  "Y-axis extent (y_max - y_min)",
+                "height": "Z-axis extent (z_max - z_min)",
+            },
+            "units": "same as input point cloud coordinate units",
+        },
+        "segments": records,
+    }
+
+    json_path = output_dir / DIMENSIONS_JSON
+    with open(json_path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+
+    print(f"\n  Dimensions saved → '{json_path.resolve()}'")
+    print("═" * col_w)
+
+    return json_path
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -706,23 +733,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Min points per segment; smaller clusters = noise.")
     p.add_argument("--merge_deg", type=float, default=DEFAULT_MERGE_DEG,
                    help="Merge clusters whose mean hue differs by less than "
-                        "this many degrees (0 = no merging). "
-                        "E.g. --merge_deg 20 collapses near-pink and pink together.")
+                        "this many degrees (0 = no merging).")
 
-    # ── Post-processing (Step 6) ──────────────────────────────────────────────
+    # Post-processing (Step 6)
     post = p.add_argument_group("post-processing (Step 6)")
     post.add_argument("--sor_neighbors", type=int, default=DEFAULT_SOR_NEIGHBORS,
-                      help="[SOR] Number of nearest neighbours for statistical "
-                           "outlier removal (default: %(default)s).")
+                      help="[SOR] Number of nearest neighbours (default: %(default)s).")
     post.add_argument("--sor_std_ratio", type=float, default=DEFAULT_SOR_STD_RATIO,
-                      help="[SOR] Std-dev multiplier: points beyond "
-                           "mean + ratio*std are removed (default: %(default)s). "
-                           "Lower = more aggressive.")
+                      help="[SOR] Std-dev multiplier threshold (default: %(default)s).")
     post.add_argument("--cc_radius", type=float, default=DEFAULT_CC_RADIUS,
-                      help="[CC] Edge-connection radius for the spatial neighbour "
-                           "graph used to find connected components "
-                           "(scene units, default: %(default)s). "
-                           "Increase for sparser clouds.")
+                      help="[CC] Edge-connection radius in scene units (default: %(default)s).")
     return p
 
 
@@ -736,7 +756,7 @@ def main() -> None:
     # 1. Load
     xyz, colors = load_pointcloud(input_path)
 
-    # 2. Cluster by gradient-color region (HSV hue space)
+    # 2. Cluster
     if args.method == "kmeans":
         labels = segment_by_kmeans(colors, args.n_segments, args.min_points)
     else:
@@ -755,14 +775,14 @@ def main() -> None:
             "  • Both    : try lowering --min_points."
         )
 
-    # 4. Save — one .ply per gradient-color region
+    # 4. Save raw segments
     saved_paths, unique_labels = save_segments(xyz, colors, labels, Path(args.output_dir))
 
-    # 5. Print dimension table with hue names (raw, pre-cleaning)
+    # 5. Print raw dimensions
     print_dimensions(xyz, colors, labels, unique_labels, saved_paths,
                      header="RAW SEGMENT DIMENSIONS (before post-processing)")
 
-    # 6. Post-process: outlier removal + largest connected component
+    # 6. Post-process: SOR + largest CC → overwrite .ply files
     clean_xyz, clean_colors, clean_labels = postprocess_segments(
         saved_paths,
         sor_neighbors=args.sor_neighbors,
@@ -771,12 +791,19 @@ def main() -> None:
         min_points=args.min_points,
     )
 
-    # 7. Re-print dimensions of the cleaned segments
-    clean_unique = sorted(set(clean_labels))
+    # Re-print dimensions using the in-memory cleaned arrays
+    clean_unique = sorted(set(clean_labels.tolist()))
     print_dimensions(
         clean_xyz, clean_colors, clean_labels,
         clean_unique, saved_paths,
         header="CLEANED SEGMENT DIMENSIONS (after outlier removal + CC extraction)",
+    )
+
+    # 7. Reload each cleaned .ply from disk, measure AABB, print + save JSON
+    measure_and_save_dimensions(
+        saved_paths,
+        output_dir=Path(args.output_dir),
+        source_file=input_path.name,
     )
 
 
