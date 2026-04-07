@@ -515,41 +515,8 @@ def remove_ground_from_cloud(
 ) -> tuple[o3d.geometry.PointCloud, int, float]:
     """
     Remove ground-level points, keeping only those that are
-    **strictly above the plane AND have at least one neighbour that is
-    also above the plane** within *neighbor_radius*.
-
-    The second condition is the key change: a lone point floating just
-    above the ground slab (noise / micro-artefact) is removed because it
-    has no above-plane companion nearby, even though its signed distance
-    from the plane is positive.
-
-    Algorithm
-    ---------
-    1.  Determine the ground Z / plane.
-            • fixed_z given  → plane is z = fixed_z  (normal = [0,0,1], d = −fixed_z)
-            • otherwise      → RANSAC on the full segment
-    2.  Compute signed distance d_i for every point.
-    3.  Mark every point with d_i > 0 as a *candidate* (above the plane).
-    4.  Build a KD-tree over the *candidate* subset only.
-    5.  For each candidate query its neighbours within *neighbor_radius*
-        in that same candidate-only tree.
-        Keep the point iff neighbour_count ≥ 1  (i.e. at least one other
-        candidate is within the radius → the point is not isolated).
-    6.  Return the surviving points.
-
-    Parameters
-    ----------
-    pcd             : input segment point cloud
-    ransac_dist     : RANSAC inlier distance threshold (ignored when fixed_z set)
-    ransac_iters    : RANSAC iterations
-    neighbor_radius : search radius for the above-plane connectivity check
-    fixed_z         : hard Z-floor (skips RANSAC when provided)
-
-    Returns
-    -------
-    clean_pcd : cloud with ground (and isolated near-ground) points removed
-    n_removed : total number of points removed
-    z_floor   : Z of the detected / specified ground plane (for reporting)
+    strictly above the plane AND have at least one neighbour that is
+    also above the plane within *neighbor_radius*.
     """
     n_before = len(pcd.points)
     if n_before == 0:
@@ -559,9 +526,8 @@ def remove_ground_from_cloud(
 
     # ── 1. Determine the ground plane ─────────────────────────────────────────
     if fixed_z is not None:
-        # Synthetic plane: z = fixed_z  →  0·x + 0·y + 1·z − fixed_z = 0
-        plane    = np.array([0.0, 0.0, 1.0, -fixed_z], dtype=np.float64)
-        z_floor  = float(fixed_z)
+        plane   = np.array([0.0, 0.0, 1.0, -fixed_z], dtype=np.float64)
+        z_floor = float(fixed_z)
     else:
         plane, z_floor = _fit_ground_ransac(pcd, ransac_dist, ransac_iters)
 
@@ -569,33 +535,25 @@ def remove_ground_from_cloud(
     dist = _signed_distances(xyz, plane)
 
     # ── 3. Candidate mask: strictly above the plane ───────────────────────────
-    above_mask    = dist > 0.0                        # (N,) bool
-    above_indices = np.where(above_mask)[0]           # indices into xyz
+    above_mask    = dist > 0.0
+    above_indices = np.where(above_mask)[0]
 
     if above_indices.size == 0:
-        # Nothing is above the ground — return empty cloud
-        empty = pcd.select_by_index([])
-        return empty, n_before, z_floor
+        return pcd.select_by_index([]), n_before, z_floor
 
     # ── 4. KD-tree over candidate (above-plane) points only ───────────────────
-    above_xyz  = xyz[above_indices]                   # (M, 3)
-    above_pcd  = o3d.geometry.PointCloud()
+    above_xyz = xyz[above_indices]
+    above_pcd = o3d.geometry.PointCloud()
     above_pcd.points = o3d.utility.Vector3dVector(above_xyz)
-    kd_tree    = o3d.geometry.KDTreeFlann(above_pcd)
+    kd_tree   = o3d.geometry.KDTreeFlann(above_pcd)
 
-    # ── 5. Connectivity filter: keep point i iff ≥ 1 neighbour within radius ──
-    #
-    #   search_radius_vector3d returns [count, indices, distances²].
-    #   We query for up to 2 hits: the point itself (distance 0) plus
-    #   potentially one more.  If count ≥ 2 the point has at least one
-    #   above-plane neighbour → keep it.
-    #
+    # ── 5. Connectivity filter: keep point iff ≥ 1 neighbour within radius ────
     keep_local = np.zeros(len(above_indices), dtype=bool)
     for local_i in range(len(above_indices)):
-        count, _, _ = kd_tree.search_radius_vector3d(
+        count, _, _ = kd_tree.search_radius_vector_3d(   # ← fixed: underscore before 3d
             above_pcd.points[local_i], neighbor_radius
         )
-        # count includes the point itself, so ≥ 2 means ≥ 1 real neighbour
+        # count includes the point itself → ≥ 2 means ≥ 1 real neighbour
         if count >= 2:
             keep_local[local_i] = True
 
