@@ -568,30 +568,27 @@ def remove_ground_from_segments(
     saved_paths: list[Path],
     ransac_dist: float,
     ransac_iters: int,
-    neighbor_radius: float,
     fixed_z: float | None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Step 7: for every saved segment .ply —
       1. Load it.
-      2. Detect the ground plane (RANSAC or fixed Z).
-      3. Keep only above-plane points that have ≥ 1 above-plane neighbour
-         within *neighbor_radius* (connectivity filter).
+      2. Run per-segment RANSAC to find ground inliers (or use fixed_z).
+      3. Remove exactly the inlier points.
       4. Overwrite the .ply with the result.
 
     Returns (combined_xyz, combined_colors, flat_labels) for reporting.
     """
     col_w = 90
     print("\n" + "═" * col_w)
-    print("  STEP 7 — GROUND-LEVEL REMOVAL  "
-          "(above-plane points with ≥ 1 above-plane neighbour)")
+    print("  STEP 7 — GROUND-LEVEL REMOVAL  (RANSAC inlier removal per segment)")
     print("═" * col_w)
     if fixed_z is not None:
-        print(f"  Mode            : fixed Z floor = {fixed_z:.4f}")
+        print(f"  Mode   : fixed Z floor = {fixed_z:.4f}  "
+              f"(tolerance ± {ransac_dist:.4f})")
     else:
-        print(f"  Mode            : RANSAC plane  "
+        print(f"  Mode   : per-segment RANSAC plane  "
               f"(dist_threshold={ransac_dist}, iters={ransac_iters})")
-    print(f"  Neighbor radius : {neighbor_radius}  (connectivity check)")
     print("─" * col_w)
     print(f"{'ID':>4}  {'File':<45}  {'Before':>8}  {'Z-floor':>9}  "
           f"{'Removed':>9}  {'After':>8}")
@@ -611,7 +608,7 @@ def remove_ground_from_segments(
             continue
 
         clean_pcd, n_removed, z_floor = remove_ground_from_cloud(
-            pcd, ransac_dist, ransac_iters, neighbor_radius, fixed_z
+            pcd, ransac_dist, ransac_iters, fixed_z
         )
 
         o3d.io.write_point_cloud(str(ply_path), clean_pcd)
