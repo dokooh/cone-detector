@@ -43,7 +43,7 @@ ABOVE_GROUND_MARGIN       = 0.05   # keep points > this height above ground (m)
 ORANGE_R_MIN, ORANGE_R_MAX = 0.55, 1.00
 ORANGE_G_MIN, ORANGE_G_MAX = 0.20, 0.65
 ORANGE_B_MIN, ORANGE_B_MAX = 0.00, 0.35
-# ── White ───────────────────────────────────────────────────────────────────
+# ── White ───────���───────────────────────────────────────────────────────────
 WHITE_MIN_BRIGHTNESS  = 0.70   # all channels ≥ this value
 WHITE_MAX_SATURATION  = 0.20   # max(RGB) − min(RGB) ≤ this value
 
@@ -51,9 +51,10 @@ WHITE_MAX_SATURATION  = 0.20   # max(RGB) − min(RGB) ≤ this value
 DBSCAN_EPS        = 0.10   # neighbourhood radius (m)
 DBSCAN_MIN_POINTS = 15     # min points to form a cluster
 
-# Size filter (metre)
-MIN_OBJ_DIMENSION = 0.03   # reject clusters smaller than this in every axis
-MAX_OBJ_DIMENSION = 5.00   # reject clusters larger than this in any axis
+# Size filter (metres)
+MIN_OBJ_DIMENSION = 0.03   # reject clusters smaller than this in every axis (m)
+MAX_OBJ_DIMENSION = 5.00   # reject clusters larger than this in any axis (m)
+MIN_OBJ_HEIGHT    = 0.10   # reject clusters shorter than this in Z (m) – ~10 cm
 
 # ──────────────────────────────────────────────────────────────────────────────
 # UNIT CONVERSION HELPERS
@@ -119,7 +120,7 @@ def load_point_cloud(path: str) -> o3d.geometry.PointCloud:
 
 # ──────────────────────────────────────────────────────────────────────────────
 # GROUND REMOVAL
-# ─────────────��────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 
 def remove_ground(pcd: o3d.geometry.PointCloud):
     """
@@ -212,7 +213,7 @@ def _print_dimensions(label: str, extent, n_pts: int):
 
 def cluster_and_measure(pcd: o3d.geometry.PointCloud):
     """
-    DBSCAN → size filter → measure each surviving cluster.
+    DBSCAN → size filter → height filter → measure each surviving cluster.
 
     Returns
     -------
@@ -247,25 +248,32 @@ def cluster_and_measure(pcd: o3d.geometry.PointCloud):
         bbox    = cluster.get_axis_aligned_bounding_box()
         extent  = bbox.get_extent()          # numpy array [dx, dy, dz]
 
-        max_ext = float(np.max(extent))
-        min_ext = float(np.min(extent))
+        max_ext  = float(np.max(extent))
+        min_ext  = float(np.min(extent))
+        height_m = float(extent[2])          # Z axis = height
 
+        # ── Size checks ───────────────────────────────────────────────────────
         if max_ext > MAX_OBJ_DIMENSION:
-            print(f"[filter] Cluster {lbl:3d}  REJECTED  too large  "
-                  f"max={max_ext*100:.1f} cm")
+            print(f"[filter] Cluster {lbl:3d}  REJECTED  too large   "
+                  f"max={max_ext*100:.1f} cm  (limit={MAX_OBJ_DIMENSION*100:.0f} cm)")
             continue
+
         if min_ext < MIN_OBJ_DIMENSION:
-            print(f"[filter] Cluster {lbl:3d}  REJECTED  too small  "
-                  f"min={min_ext*100:.1f} cm")
+            print(f"[filter] Cluster {lbl:3d}  REJECTED  too small   "
+                  f"min={min_ext*100:.1f} cm  (limit={MIN_OBJ_DIMENSION*100:.0f} cm)")
+            continue
+
+        # ── Height check ──────────────────────────────────────────────────────
+        if height_m < MIN_OBJ_HEIGHT:
+            print(f"[filter] Cluster {lbl:3d}  REJECTED  too short   "
+                  f"height={height_m*100:.1f} cm  (min={MIN_OBJ_HEIGHT*100:.0f} cm)")
             continue
 
         dx, dy, dz = float(extent[0]), float(extent[1]), float(extent[2])
-        height_m = dz
         width_m  = min(dx, dy)
         length_m = max(dx, dy)
 
-        print(f"[filter] Cluster {lbl:3d}  ACCEPTED  "
-              f"→  Object #{accepted}")
+        print(f"[filter] Cluster {lbl:3d}  ACCEPTED  →  Object #{accepted}")
         _print_dimensions(f"Object #{accepted}  (cluster {lbl})", extent, len(idx))
 
         objects.append(dict(
@@ -326,7 +334,7 @@ def save_objects(objects: list, output_dir: str):
 # OPTIONAL VISUALISATION
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Distinct colours for up to 20 objects; cycles if more exist.
+# Distinct colours for up to 10 objects; cycles if more exist.
 _PALETTE = [
     [1.00, 0.45, 0.00],   # orange
     [0.20, 0.60, 1.00],   # blue
@@ -398,6 +406,8 @@ def parse_args():
         help="Minimum bounding-box extent in any direction (m)")
     p.add_argument("--max-size", type=float, default=MAX_OBJ_DIMENSION,
         help="Maximum bounding-box extent in any direction (m)")
+    p.add_argument("--min-height", type=float, default=MIN_OBJ_HEIGHT,
+        help="Minimum object height / Z extent (m)  [default: 0.10 = 10 cm]")
     return p.parse_args()
 
 
@@ -411,13 +421,14 @@ def main():
     # Apply CLI overrides to module-level constants
     global GROUND_DISTANCE_THRESHOLD, ABOVE_GROUND_MARGIN
     global DBSCAN_EPS, DBSCAN_MIN_POINTS
-    global MIN_OBJ_DIMENSION, MAX_OBJ_DIMENSION
+    global MIN_OBJ_DIMENSION, MAX_OBJ_DIMENSION, MIN_OBJ_HEIGHT
     GROUND_DISTANCE_THRESHOLD = args.ground_threshold
     ABOVE_GROUND_MARGIN       = args.above_margin
     DBSCAN_EPS                = args.eps
     DBSCAN_MIN_POINTS         = args.min_points
     MIN_OBJ_DIMENSION         = args.min_size
     MAX_OBJ_DIMENSION         = args.max_size
+    MIN_OBJ_HEIGHT            = args.min_height
 
     banner = "  ColorObjectsDetector – Construction Site"
     print("=" * len(banner))
