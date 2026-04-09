@@ -43,7 +43,7 @@ ABOVE_GROUND_MARGIN       = 0.05   # keep points > this height above ground (m)
 ORANGE_R_MIN, ORANGE_R_MAX = 0.55, 1.00
 ORANGE_G_MIN, ORANGE_G_MAX = 0.20, 0.65
 ORANGE_B_MIN, ORANGE_B_MAX = 0.00, 0.35
-# ── White ───────���───────────────────────────────────────────────────────────
+# ── White ───────────────────────────────────────────────────────────────────
 WHITE_MIN_BRIGHTNESS  = 0.70   # all channels ≥ this value
 WHITE_MAX_SATURATION  = 0.20   # max(RGB) − min(RGB) ≤ this value
 
@@ -118,7 +118,7 @@ def load_point_cloud(path: str) -> o3d.geometry.PointCloud:
     return pcd
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ────────────��─────────────────────────────────────────────────────────────────
 # GROUND REMOVAL
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -195,19 +195,26 @@ def filter_by_colour(pcd: o3d.geometry.PointCloud) -> o3d.geometry.PointCloud:
 # CLUSTERING + MEASUREMENT
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _print_dimensions(label: str, extent, n_pts: int):
-    """Pretty-print an object's dimensions."""
-    # extent is ordered (dx, dy, dz); we report W × L × H
+def _compute_centroid(cluster: o3d.geometry.PointCloud) -> np.ndarray:
+    """Return the mean XYZ position of a cluster as a (3,) array."""
+    return np.asarray(cluster.points).mean(axis=0)
+
+
+def _print_dimensions(label: str, extent, centroid: np.ndarray, n_pts: int):
+    """Pretty-print an object's dimensions and location."""
     dx, dy, dz = float(extent[0]), float(extent[1]), float(extent[2])
     width  = min(dx, dy)
     length = max(dx, dy)
     height = dz
+    cx, cy, cz = centroid
 
     print(f"  {label}")
-    print(f"    Points : {n_pts:,}")
-    print(f"    Height : {metres_to_str(height)}")
-    print(f"    Width  : {metres_to_str(width)}")
-    print(f"    Length : {metres_to_str(length)}")
+    print(f"    Points   : {n_pts:,}")
+    print(f"    Height   : {metres_to_str(height)}")
+    print(f"    Width    : {metres_to_str(width)}")
+    print(f"    Length   : {metres_to_str(length)}")
+    print(f"    Location : X={cx:.4f} m   Y={cy:.4f} m   Z={cz:.4f} m  "
+          f"(centroid)")
     return height, width, length
 
 
@@ -218,10 +225,14 @@ def cluster_and_measure(pcd: o3d.geometry.PointCloud):
     Returns
     -------
     List of dicts with keys:
-        cluster  – PointCloud
-        bbox     – AxisAlignedBoundingBox
-        height_m, width_m, length_m  – floats (metres)
-        label    – int cluster index
+        cluster            – PointCloud
+        bbox               – AxisAlignedBoundingBox
+        height_m           – float (metres)
+        width_m            – float (metres)
+        length_m           – float (metres)
+        centroid           – np.ndarray shape (3,)  [X, Y, Z in metres]
+        label              – int  (DBSCAN cluster index)
+        index              – int  (accepted-object counter)
     """
     if len(pcd.points) == 0:
         print("[cluster] No coloured points to cluster.")
@@ -270,11 +281,14 @@ def cluster_and_measure(pcd: o3d.geometry.PointCloud):
             continue
 
         dx, dy, dz = float(extent[0]), float(extent[1]), float(extent[2])
-        width_m  = min(dx, dy)
-        length_m = max(dx, dy)
+        width_m    = min(dx, dy)
+        length_m   = max(dx, dy)
+        centroid   = _compute_centroid(cluster)
 
         print(f"[filter] Cluster {lbl:3d}  ACCEPTED  →  Object #{accepted}")
-        _print_dimensions(f"Object #{accepted}  (cluster {lbl})", extent, len(idx))
+        _print_dimensions(
+            f"Object #{accepted}  (cluster {lbl})", extent, centroid, len(idx)
+        )
 
         objects.append(dict(
             label    = lbl,
@@ -284,6 +298,7 @@ def cluster_and_measure(pcd: o3d.geometry.PointCloud):
             height_m = height_m,
             width_m  = width_m,
             length_m = length_m,
+            centroid = centroid,
         ))
         accepted += 1
 
@@ -302,8 +317,14 @@ def save_objects(objects: list, output_dir: str):
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    csv_rows = ["index,cluster_label,height_cm,height_ft,"
-                "width_cm,width_ft,length_cm,length_ft,points"]
+    csv_rows = [
+        "index,cluster_label,"
+        "centroid_x_m,centroid_y_m,centroid_z_m,"
+        "height_cm,height_ft,"
+        "width_cm,width_ft,"
+        "length_cm,length_ft,"
+        "points"
+    ]
 
     for obj in objects:
         idx = obj["index"]
@@ -315,9 +336,11 @@ def save_objects(objects: list, output_dir: str):
               f"({len(obj['cluster'].points):,} pts)  →  {ply_path}")
 
         # ── CSV row ──────────────────────────────────────────────────────────
-        h, w, l = obj["height_m"], obj["width_m"], obj["length_m"]
+        h, w, l  = obj["height_m"], obj["width_m"], obj["length_m"]
+        cx, cy, cz = obj["centroid"]
         csv_rows.append(
             f"{idx},{obj['label']},"
+            f"{cx:.4f},{cy:.4f},{cz:.4f},"
             f"{h*M_TO_CM:.2f},{h*M_TO_FEET:.4f},"
             f"{w*M_TO_CM:.2f},{w*M_TO_FEET:.4f},"
             f"{l*M_TO_CM:.2f},{l*M_TO_FEET:.4f},"
