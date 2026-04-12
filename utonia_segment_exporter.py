@@ -858,6 +858,7 @@ def main() -> None:
         saved_paths,
         ransac_dist=args.ground_ransac_dist,
         ransac_iters=args.ground_ransac_iters,
+        neighbor_radius=args.ground_neighbor_radius,
         fixed_z=args.ground_fixed_z,
     )
 
