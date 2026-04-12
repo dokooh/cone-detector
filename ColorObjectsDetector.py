@@ -161,9 +161,6 @@ def remove_ground(pcd: o3d.geometry.PointCloud):
 def filter_by_colour(pcd: o3d.geometry.PointCloud) -> o3d.geometry.PointCloud:
     """
     Keep only orange and white points.
-    Orange is distinguished from brown via a G/R ratio guard:
-      - Brown:  G/R < 0.35  (green channel very suppressed relative to red)
-      - Orange: 0.35 ≤ G/R ≤ 0.75
     If the cloud carries no colour data, all points are kept (with a warning).
     """
     if not pcd.has_colors():
@@ -173,37 +170,26 @@ def filter_by_colour(pcd: o3d.geometry.PointCloud) -> o3d.geometry.PointCloud:
     colours = np.asarray(pcd.colors)          # (N, 3) in [0, 1]
     r, g, b = colours[:, 0], colours[:, 1], colours[:, 2]
 
-    # Avoid division by zero for near-black points
-    r_safe = np.where(r > 0.01, r, 0.01)
-    g_over_r = g / r_safe
-
-    # ── Orange ───────────────────────────────────────────────────────────────
-    # RGB box filter …
-    orange_box = (
+    # Orange
+    orange_mask = (
         (r >= ORANGE_R_MIN) & (r <= ORANGE_R_MAX) &
         (g >= ORANGE_G_MIN) & (g <= ORANGE_G_MAX) &
         (b >= ORANGE_B_MIN) & (b <= ORANGE_B_MAX)
     )
-    # … plus G/R ratio guard to separate orange from brown and yellow
-    orange_ratio = (
-        (g_over_r >= ORANGE_MIN_G_OVER_R) &
-        (g_over_r <= ORANGE_MAX_G_OVER_R)
-    )
-    orange_mask = orange_box & orange_ratio
 
-    # ── White ───────────────��────────────────────────────────────────────────
+    # White
     brightness = (r + g + b) / 3.0
     saturation = np.max(colours, axis=1) - np.min(colours, axis=1)
     white_mask = (brightness >= WHITE_MIN_BRIGHTNESS) & (saturation <= WHITE_MAX_SATURATION)
 
     combined_idx = np.where(orange_mask | white_mask)[0]
 
-    print(f"[colour] Orange : {orange_mask.sum():,} pts  "
-          f"(box={orange_box.sum():,}  after G/R ratio filter={orange_mask.sum():,})")
+    print(f"[colour] Orange : {orange_mask.sum():,} pts")
     print(f"[colour] White  : {white_mask.sum():,} pts")
     print(f"[colour] Total  : {len(combined_idx):,} pts kept after colour filter")
 
     return pcd.select_by_index(combined_idx)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CLUSTERING + MEASUREMENT
