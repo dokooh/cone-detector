@@ -12,9 +12,13 @@ Pipeline:
   4. Filter by orange / white colour
   5. Cluster the remaining points (DBSCAN)
   6. For every cluster: measure H × W × L in cm and feet, save as .ply
+  7. Render a 2-D image per cluster, run Grounding-DINO (SAM3) zero-shot
+     detection with prompts ['cone', 'barricade']; rename matched clusters.
 
 Dependencies:
-    pip install open3d numpy laspy lazrs-python
+    pip install open3d numpy laspy lazrs-python pillow
+    pip install torch torchvision
+    pip install transformers   # for Grounding-DINO via HuggingFace
 """
 
 import argparse
@@ -26,7 +30,6 @@ try:
     import open3d as o3d
 except ImportError:
     sys.exit("open3d is required.  Install with:  pip install open3d")
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # TUNEABLE PARAMETERS
@@ -40,9 +43,14 @@ ABOVE_GROUND_MARGIN       = 0.05   # keep points > this height above ground (m)
 
 # Colour thresholds — RGB in [0, 1]
 # ── Orange ──────────────────────────────────────────────────────────────────
+# Brown vs orange separation:
+#   Brown:  high R, very low G (G/R < 0.35), low B
+#   Orange: high R, moderate G (G/R ≥ 0.35), low B
 ORANGE_R_MIN, ORANGE_R_MAX = 0.55, 1.00
-ORANGE_G_MIN, ORANGE_G_MAX = 0.20, 0.65
-ORANGE_B_MIN, ORANGE_B_MAX = 0.00, 0.35
+ORANGE_G_MIN, ORANGE_G_MAX = 0.28, 0.65   # raised from 0.20 to exclude brown
+ORANGE_B_MIN, ORANGE_B_MAX = 0.00, 0.30   # tightened from 0.35
+ORANGE_MIN_G_OVER_R        = 0.35         # G/R ratio floor – rejects brown
+ORANGE_MAX_G_OVER_R        = 0.75         # G/R ratio ceiling – rejects yellow
 # ── White ───────────────────────────────────────────────────────────────────
 WHITE_MIN_BRIGHTNESS  = 0.70   # all channels ≥ this value
 WHITE_MAX_SATURATION  = 0.20   # max(RGB) − min(RGB) ≤ this value
@@ -55,6 +63,12 @@ DBSCAN_MIN_POINTS = 15     # min points to form a cluster
 MIN_OBJ_DIMENSION = 0.03   # reject clusters smaller than this in every axis (m)
 MAX_OBJ_DIMENSION = 5.00   # reject clusters larger than this in any axis (m)
 MIN_OBJ_HEIGHT    = 0.10   # reject clusters shorter than this in Z (m) – ~10 cm
+
+# Classification (Grounding-DINO / SAM3)
+DETECTION_PROMPTS      = ["cone", "barricade"]
+DETECTION_MODEL_ID     = "IDEA-Research/grounding-dino-tiny"   # HuggingFace model id
+DETECTION_BOX_THRESH   = 0.30   # confidence threshold for a detection to count
+RENDER_IMAGE_SIZE      = 512    # pixel size of the rendered cluster image (square)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # UNIT CONVERSION HELPERS
@@ -118,7 +132,7 @@ def load_point_cloud(path: str) -> o3d.geometry.PointCloud:
     return pcd
 
 
-# ────────────��─────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 # GROUND REMOVAL
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -161,6 +175,9 @@ def remove_ground(pcd: o3d.geometry.PointCloud):
 def filter_by_colour(pcd: o3d.geometry.PointCloud) -> o3d.geometry.PointCloud:
     """
     Keep only orange and white points.
+    Orange is distinguished from brown via a G/R ratio guard:
+      - Brown:  G/R < 0.35  (green channel very suppressed relative to red)
+      - Orange: 0.35 ≤ G/R ≤ 0.75
     If the cloud carries no colour data, all points are kept (with a warning).
     """
     if not pcd.has_colors():
@@ -170,21 +187,32 @@ def filter_by_colour(pcd: o3d.geometry.PointCloud) -> o3d.geometry.PointCloud:
     colours = np.asarray(pcd.colors)          # (N, 3) in [0, 1]
     r, g, b = colours[:, 0], colours[:, 1], colours[:, 2]
 
-    # Orange
-    orange_mask = (
+    # Avoid division by zero for near-black points
+    r_safe   = np.where(r > 0.01, r, 0.01)
+    g_over_r = g / r_safe
+
+    # ── Orange ───────────────────────────────────────────────────────────────
+    orange_box = (
         (r >= ORANGE_R_MIN) & (r <= ORANGE_R_MAX) &
         (g >= ORANGE_G_MIN) & (g <= ORANGE_G_MAX) &
         (b >= ORANGE_B_MIN) & (b <= ORANGE_B_MAX)
     )
+    # G/R ratio guard separates orange from brown (too low) and yellow (too high)
+    orange_ratio = (
+        (g_over_r >= ORANGE_MIN_G_OVER_R) &
+        (g_over_r <= ORANGE_MAX_G_OVER_R)
+    )
+    orange_mask = orange_box & orange_ratio
 
-    # White
+    # ── White ────────────────────────────────────────────────────────────────
     brightness = (r + g + b) / 3.0
     saturation = np.max(colours, axis=1) - np.min(colours, axis=1)
     white_mask = (brightness >= WHITE_MIN_BRIGHTNESS) & (saturation <= WHITE_MAX_SATURATION)
 
     combined_idx = np.where(orange_mask | white_mask)[0]
 
-    print(f"[colour] Orange : {orange_mask.sum():,} pts")
+    print(f"[colour] Orange : {orange_mask.sum():,} pts  "
+          f"(box={orange_box.sum():,}  after G/R ratio={orange_mask.sum():,})")
     print(f"[colour] White  : {white_mask.sum():,} pts")
     print(f"[colour] Total  : {len(combined_idx):,} pts kept after colour filter")
 
@@ -233,6 +261,7 @@ def cluster_and_measure(pcd: o3d.geometry.PointCloud):
         centroid           – np.ndarray shape (3,)  [X, Y, Z in metres]
         label              – int  (DBSCAN cluster index)
         index              – int  (accepted-object counter)
+        class_name         – str  (set to "object" here; updated by classify_objects)
     """
     if len(pcd.points) == 0:
         print("[cluster] No coloured points to cluster.")
@@ -291,18 +320,187 @@ def cluster_and_measure(pcd: o3d.geometry.PointCloud):
         )
 
         objects.append(dict(
-            label    = lbl,
-            index    = accepted,
-            cluster  = cluster,
-            bbox     = bbox,
-            height_m = height_m,
-            width_m  = width_m,
-            length_m = length_m,
-            centroid = centroid,
+            label      = lbl,
+            index      = accepted,
+            cluster    = cluster,
+            bbox       = bbox,
+            height_m   = height_m,
+            width_m    = width_m,
+            length_m   = length_m,
+            centroid   = centroid,
+            class_name = "object",   # placeholder; updated in classify_objects()
+            confidence = 0.0,
         ))
         accepted += 1
 
     print(f"\n[result] {len(objects)} object(s) detected after size filtering.")
+    return objects
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 2-D RENDERING
+# ──────────────────────────────────────────────────────────────────────────────
+
+def render_cluster_to_image(cluster: o3d.geometry.PointCloud,
+                             size: int = RENDER_IMAGE_SIZE):
+    """
+    Project a single cluster onto a 2-D top-down image (XY plane).
+
+    Strategy
+    --------
+    • Normalise XY to [0, size-1] pixel coordinates.
+    • Colour each pixel with the point's RGB (or solid orange if no colours).
+    • Return a PIL Image (RGB).
+
+    The top-down view reliably shows the footprint + colours for both cones
+    and barricades and does not require an OpenGL window.
+    """
+    try:
+        from PIL import Image as PILImage
+    except ImportError:
+        sys.exit("Pillow is required for rendering.  pip install pillow")
+
+    pts = np.asarray(cluster.points)          # (N, 3)
+
+    if cluster.has_colors():
+        cols = (np.asarray(cluster.colors) * 255).astype(np.uint8)   # (N, 3)
+    else:
+        cols = np.full((len(pts), 3), [255, 115, 0], dtype=np.uint8)  # orange
+
+    # Normalise XY to [0, size-1]
+    xy   = pts[:, :2]
+    mins = xy.min(axis=0)
+    maxs = xy.max(axis=0)
+    span = maxs - mins
+    span[span == 0] = 1.0   # avoid /0 for degenerate cases
+
+    px = ((xy - mins) / span * (size - 1)).astype(int)
+
+    # Build image — later points overwrite earlier ones (fine for our use case)
+    img_arr = np.full((size, size, 3), 40, dtype=np.uint8)   # dark grey background
+    img_arr[size - 1 - px[:, 1], px[:, 0]] = cols            # flip Y so up=up
+
+    return PILImage.fromarray(img_arr, mode="RGB")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CLASSIFICATION  (Grounding-DINO / SAM3 via HuggingFace)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _load_grounding_dino():
+    """
+    Load Grounding-DINO (the open-vocabulary detector used inside SAM3)
+    from HuggingFace Transformers.  Downloads weights on first run (~700 MB).
+    """
+    try:
+        from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
+        import torch
+    except ImportError:
+        sys.exit(
+            "transformers and torch are required for classification.\n"
+            "  pip install torch torchvision transformers"
+        )
+
+    print(f"[classify] Loading model  '{DETECTION_MODEL_ID}'  from HuggingFace …")
+    processor = AutoProcessor.from_pretrained(DETECTION_MODEL_ID)
+    model     = AutoModelForZeroShotObjectDetection.from_pretrained(DETECTION_MODEL_ID)
+
+    import torch
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model  = model.to(device)
+    model.eval()
+    print(f"[classify] Model loaded  (device: {device})")
+    return processor, model, device
+
+
+def classify_objects(objects: list,
+                     prompts: list  = DETECTION_PROMPTS,
+                     box_thresh: float = DETECTION_BOX_THRESH):
+    """
+    For every accepted cluster:
+      1. Render a top-down 2-D image.
+      2. Run Grounding-DINO zero-shot detection with the given text prompts.
+      3. If a prompt is detected above box_thresh, update obj['class_name']
+         and obj['confidence'] with the highest-scoring label.
+
+    Modifies `objects` in-place and returns it.
+    """
+    if not objects:
+        return objects
+
+    try:
+        import torch
+        from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
+    except ImportError:
+        print("[classify] WARNING: transformers / torch not installed – "
+              "skipping classification step.")
+        return objects
+
+    processor, model, device = _load_grounding_dino()
+
+    # Grounding-DINO expects a single dot-separated prompt string
+    # e.g. "cone . barricade ."
+    text_prompt = " . ".join(prompts) + " ."
+
+    print(f"[classify] Text prompt : '{text_prompt}'")
+    print(f"[classify] Box threshold : {box_thresh}")
+
+    for obj in objects:
+        idx     = obj["index"]
+        cluster = obj["cluster"]
+
+        # ── 1. Render ─────────────────────────────────────────────────────────
+        image = render_cluster_to_image(cluster, size=RENDER_IMAGE_SIZE)
+
+        # ── 2. Inference ──────────────────────────────────────────────────────
+        import torch
+        inputs = processor(images=image, text=text_prompt, return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            outputs = model(**inputs)
+
+        # Post-process → boxes + scores + labels per image
+        target_sizes = torch.tensor([image.size[::-1]], device=device)  # (H, W)
+        results = processor.post_process_grounded_object_detection(
+            outputs,
+            inputs["input_ids"],
+            box_threshold  = box_thresh,
+            text_threshold = box_thresh,
+            target_sizes   = target_sizes,
+        )[0]   # single image → first (and only) result
+
+        scores = results["scores"].cpu().numpy()   # (K,)
+        labels = results["labels"]                 # list[str]
+
+        # ── 3. Pick the best detection ────────────────────────────────────────
+        if len(scores) == 0:
+            print(f"[classify] Object #{idx:03d}  →  no match  "
+                  f"(class kept as '{obj['class_name']}')")
+            continue
+
+        best_i      = int(np.argmax(scores))
+        best_label  = labels[best_i].strip().lower()
+        best_score  = float(scores[best_i])
+
+        # Accept only if the label matches one of our prompts exactly
+        matched_prompt = None
+        for prompt in prompts:
+            if prompt.lower() in best_label:
+                matched_prompt = prompt
+                break
+
+        if matched_prompt is None:
+            print(f"[classify] Object #{idx:03d}  →  detected '{best_label}' "
+                  f"(score={best_score:.2f}) but not in prompts – kept as "
+                  f"'{obj['class_name']}'")
+            continue
+
+        obj["class_name"] = matched_prompt
+        obj["confidence"] = best_score
+        print(f"[classify] Object #{idx:03d}  →  '{matched_prompt}'  "
+              f"(confidence={best_score:.2f})")
+
     return objects
 
 
@@ -312,39 +510,61 @@ def cluster_and_measure(pcd: o3d.geometry.PointCloud):
 
 def save_objects(objects: list, output_dir: str):
     """
-    Save every detected object as   <output_dir>/object_NNN.ply
-    and write a summary CSV          <output_dir>/summary.csv
+    Save every detected object as:
+        <output_dir>/<class_name>_NNN.ply        (point cloud)
+        <output_dir>/<class_name>_NNN_view.png   (2-D render)
+        <output_dir>/summary.csv                 (measurements + location + class)
     """
     os.makedirs(output_dir, exist_ok=True)
 
+    # Track per-class counters so names are cone_000, cone_001, barricade_000 …
+    class_counters: dict = {}
+
     csv_rows = [
-        "index,cluster_label,"
+        "index,cluster_label,class_name,confidence,"
         "centroid_x_m,centroid_y_m,centroid_z_m,"
         "height_cm,height_ft,"
         "width_cm,width_ft,"
         "length_cm,length_ft,"
-        "points"
+        "points,ply_file"
     ]
 
     for obj in objects:
-        idx = obj["index"]
+        idx        = obj["index"]
+        class_name = obj["class_name"]
+        conf       = obj["confidence"]
+
+        # Build a unique filename per class
+        class_counters.setdefault(class_name, 0)
+        class_idx  = class_counters[class_name]
+        class_counters[class_name] += 1
+        stem       = f"{class_name}_{class_idx:03d}"
 
         # ── point cloud ──────────────────────────────────────────────────────
-        ply_path = os.path.join(output_dir, f"object_{idx:03d}.ply")
+        ply_path = os.path.join(output_dir, f"{stem}.ply")
         o3d.io.write_point_cloud(ply_path, obj["cluster"])
-        print(f"[save]   object_{idx:03d}.ply  "
+        print(f"[save]   {stem}.ply  "
               f"({len(obj['cluster'].points):,} pts)  →  {ply_path}")
 
+        # ── 2-D render ───────────────────────────────────────────────────────
+        try:
+            img      = render_cluster_to_image(obj["cluster"])
+            img_path = os.path.join(output_dir, f"{stem}_view.png")
+            img.save(img_path)
+            print(f"[save]   {stem}_view.png  →  {img_path}")
+        except Exception as exc:
+            print(f"[save]   WARNING: could not save render for {stem}: {exc}")
+
         # ── CSV row ──────────────────────────────────────────────────────────
-        h, w, l  = obj["height_m"], obj["width_m"], obj["length_m"]
+        h, w, l    = obj["height_m"], obj["width_m"], obj["length_m"]
         cx, cy, cz = obj["centroid"]
         csv_rows.append(
-            f"{idx},{obj['label']},"
+            f"{idx},{obj['label']},{class_name},{conf:.3f},"
             f"{cx:.4f},{cy:.4f},{cz:.4f},"
             f"{h*M_TO_CM:.2f},{h*M_TO_FEET:.4f},"
             f"{w*M_TO_CM:.2f},{w*M_TO_FEET:.4f},"
             f"{l*M_TO_CM:.2f},{l*M_TO_FEET:.4f},"
-            f"{len(obj['cluster'].points)}"
+            f"{len(obj['cluster'].points)},{stem}.ply"
         )
 
     csv_path = os.path.join(output_dir, "summary.csv")
@@ -415,6 +635,13 @@ def parse_args():
         help="Skip writing output files")
     p.add_argument("--visualise", action="store_true",
         help="Open interactive 3-D viewer after processing")
+    p.add_argument("--no-classify", action="store_true",
+        help="Skip the Grounding-DINO classification step")
+    p.add_argument("--prompts", nargs="+", default=DETECTION_PROMPTS,
+        help="Text prompts for zero-shot classification  "
+             "(default: cone barricade)")
+    p.add_argument("--box-thresh", type=float, default=DETECTION_BOX_THRESH,
+        help="Confidence threshold for Grounding-DINO detections")
 
     # Overridable thresholds
     p.add_argument("--ground-threshold", type=float, default=GROUND_DISTANCE_THRESHOLD,
@@ -445,6 +672,7 @@ def main():
     global GROUND_DISTANCE_THRESHOLD, ABOVE_GROUND_MARGIN
     global DBSCAN_EPS, DBSCAN_MIN_POINTS
     global MIN_OBJ_DIMENSION, MAX_OBJ_DIMENSION, MIN_OBJ_HEIGHT
+
     GROUND_DISTANCE_THRESHOLD = args.ground_threshold
     ABOVE_GROUND_MARGIN       = args.above_margin
     DBSCAN_EPS                = args.eps
@@ -470,19 +698,34 @@ def main():
     # ── 4. Cluster + measure ──────────────────────────────────────────────────
     objects = cluster_and_measure(colour_pcd)
 
-    # ── 5. Save ───────────────────────────────────────────────────────────────
+    # ── 5. Classify with Grounding-DINO (SAM3) ────────────────────────────────
+    if not args.no_classify and objects:
+        print(f"\n[classify] Running zero-shot classification "
+              f"with prompts {args.prompts} …")
+        objects = classify_objects(
+            objects,
+            prompts    = args.prompts,
+            box_thresh = args.box_thresh,
+        )
+
+    # ── 6. Save ───────────────────────────────────────────────────────────────
     if not args.no_save:
         if objects:
             save_objects(objects, args.output_dir)
         else:
             print("[save]   Nothing to save.")
 
-    # ── 6. Visualise ──────────────────────────────────────────────────────────
+    # ── 7. Visualise ──────────────────────────────────────────────────────────
     if args.visualise:
         visualise(pcd, objects, ground_model)
 
     print("=" * len(banner))
     print(f"  Done.  {len(objects)} object(s) detected.")
+    # Print final class summary
+    from collections import Counter
+    counts = Counter(obj["class_name"] for obj in objects)
+    for cls, cnt in sorted(counts.items()):
+        print(f"    {cls:20s}: {cnt}")
     print("=" * len(banner))
     return 0 if objects else 1
 
