@@ -65,10 +65,10 @@ MAX_OBJ_DIMENSION = 5.00   # reject clusters larger than this in any axis (m)
 MIN_OBJ_HEIGHT    = 0.10   # reject clusters shorter than this in Z (m) – ~10 cm
 
 # Classification (Grounding-DINO / SAM3)
-DETECTION_PROMPTS      = ["cone", "barricade"]
-DETECTION_MODEL_ID     = "IDEA-Research/grounding-dino-tiny"   # HuggingFace model id
-DETECTION_BOX_THRESH   = 0.30   # confidence threshold for a detection to count
-RENDER_IMAGE_SIZE      = 512    # pixel size of the rendered cluster image (square)
+DETECTION_PROMPTS    = ["cone", "barricade"]
+DETECTION_MODEL_ID   = "IDEA-Research/grounding-dino-tiny"   # HuggingFace model id
+DETECTION_BOX_THRESH = 0.30   # confidence threshold for a detection to count
+RENDER_IMAGE_SIZE    = 512    # pixel size of the rendered cluster image (square)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # UNIT CONVERSION HELPERS
@@ -168,7 +168,7 @@ def remove_ground(pcd: o3d.geometry.PointCloud):
     return above_pcd, plane_model
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────��─────────────────────────────────────────────────
 # COLOUR FILTERING
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -262,6 +262,7 @@ def cluster_and_measure(pcd: o3d.geometry.PointCloud):
         label              – int  (DBSCAN cluster index)
         index              – int  (accepted-object counter)
         class_name         – str  (set to "object" here; updated by classify_objects)
+        confidence         – float (0.0 until classify_objects runs)
     """
     if len(pcd.points) == 0:
         print("[cluster] No coloured points to cluster.")
@@ -380,7 +381,8 @@ def render_cluster_to_image(cluster: o3d.geometry.PointCloud,
     img_arr = np.full((size, size, 3), 40, dtype=np.uint8)   # dark grey background
     img_arr[size - 1 - px[:, 1], px[:, 0]] = cols            # flip Y so up=up
 
-    return PILImage.fromarray(img_arr, mode="RGB")
+    # FIX 1: drop the deprecated `mode=` kwarg; uint8 (H,W,3) is auto-detected as RGB
+    return PILImage.fromarray(img_arr)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -414,7 +416,7 @@ def _load_grounding_dino():
 
 
 def classify_objects(objects: list,
-                     prompts: list  = DETECTION_PROMPTS,
+                     prompts: list     = DETECTION_PROMPTS,
                      box_thresh: float = DETECTION_BOX_THRESH):
     """
     For every accepted cluster:
@@ -442,7 +444,7 @@ def classify_objects(objects: list,
     # e.g. "cone . barricade ."
     text_prompt = " . ".join(prompts) + " ."
 
-    print(f"[classify] Text prompt : '{text_prompt}'")
+    print(f"[classify] Text prompt   : '{text_prompt}'")
     print(f"[classify] Box threshold : {box_thresh}")
 
     for obj in objects:
@@ -462,12 +464,14 @@ def classify_objects(objects: list,
 
         # Post-process → boxes + scores + labels per image
         target_sizes = torch.tensor([image.size[::-1]], device=device)  # (H, W)
+
+        # FIX 2: use `threshold=` (single param) instead of the removed
+        # `box_threshold=` / `text_threshold=` keyword arguments.
         results = processor.post_process_grounded_object_detection(
             outputs,
             inputs["input_ids"],
-            box_threshold  = box_thresh,
-            text_threshold = box_thresh,
-            target_sizes   = target_sizes,
+            threshold    = box_thresh,
+            target_sizes = target_sizes,
         )[0]   # single image → first (and only) result
 
         scores = results["scores"].cpu().numpy()   # (K,)
@@ -479,11 +483,11 @@ def classify_objects(objects: list,
                   f"(class kept as '{obj['class_name']}')")
             continue
 
-        best_i      = int(np.argmax(scores))
-        best_label  = labels[best_i].strip().lower()
-        best_score  = float(scores[best_i])
+        best_i     = int(np.argmax(scores))
+        best_label = labels[best_i].strip().lower()
+        best_score = float(scores[best_i])
 
-        # Accept only if the label matches one of our prompts exactly
+        # Accept only if the label matches one of our prompts
         matched_prompt = None
         for prompt in prompts:
             if prompt.lower() in best_label:
@@ -536,9 +540,9 @@ def save_objects(objects: list, output_dir: str):
 
         # Build a unique filename per class
         class_counters.setdefault(class_name, 0)
-        class_idx  = class_counters[class_name]
+        class_idx = class_counters[class_name]
         class_counters[class_name] += 1
-        stem       = f"{class_name}_{class_idx:03d}"
+        stem      = f"{class_name}_{class_idx:03d}"
 
         # ── point cloud ──────────────────────────────────────────────────────
         ply_path = os.path.join(output_dir, f"{stem}.ply")
