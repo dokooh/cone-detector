@@ -12,13 +12,13 @@ Pipeline:
   4. Filter by orange / white colour
   5. Cluster the remaining points (DBSCAN)
   6. For every cluster: measure H × W × L in cm and feet, save as .ply
-  7. Render a 2-D image per cluster, run Grounding-DINO (SAM3) zero-shot
-     detection with prompts ['cone', 'barricade']; rename matched clusters.
+  7. Render a 2-D image per cluster, run SAM3 zero-shot instance segmentation
+     with text prompts ['cone', 'barricade']; rename matched clusters.
 
 Dependencies:
     pip install open3d numpy laspy lazrs-python pillow
     pip install torch torchvision
-    pip install transformers   # for Grounding-DINO via HuggingFace
+    pip install transformers   # for SAM3 via HuggingFace
 """
 
 import argparse
@@ -64,11 +64,12 @@ MIN_OBJ_DIMENSION = 0.03   # reject clusters smaller than this in every axis (m)
 MAX_OBJ_DIMENSION = 5.00   # reject clusters larger than this in any axis (m)
 MIN_OBJ_HEIGHT    = 0.10   # reject clusters shorter than this in Z (m) – ~10 cm
 
-# Classification (Grounding-DINO / SAM3)
-DETECTION_PROMPTS    = ["cone", "barricade"]
-DETECTION_MODEL_ID   = "IDEA-Research/grounding-dino-tiny"   # HuggingFace model id
-DETECTION_BOX_THRESH = 0.30   # confidence threshold for a detection to count
-RENDER_IMAGE_SIZE    = 512    # pixel size of the rendered cluster image (square)
+# Classification (SAM3)
+DETECTION_PROMPTS     = ["cone", "barricade"]
+SAM3_MODEL_ID         = "facebook/sam3"
+DETECTION_BOX_THRESH  = 0.50   # confidence threshold for a detection to count
+DETECTION_MASK_THRESH = 0.50   # mask binarisation threshold
+RENDER_IMAGE_SIZE     = 512    # pixel size of the rendered cluster image (square)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # UNIT CONVERSION HELPERS
@@ -168,7 +169,7 @@ def remove_ground(pcd: o3d.geometry.PointCloud):
     return above_pcd, plane_model
 
 
-# ────────────────────────────��─────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 # COLOUR FILTERING
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -263,6 +264,7 @@ def cluster_and_measure(pcd: o3d.geometry.PointCloud):
         index              – int  (accepted-object counter)
         class_name         – str  (set to "object" here; updated by classify_objects)
         confidence         – float (0.0 until classify_objects runs)
+        n_masks            – int  (number of SAM3 masks found; 0 until classify_objects)
     """
     if len(pcd.points) == 0:
         print("[cluster] No coloured points to cluster.")
@@ -331,6 +333,7 @@ def cluster_and_measure(pcd: o3d.geometry.PointCloud):
             centroid   = centroid,
             class_name = "object",   # placeholder; updated in classify_objects()
             confidence = 0.0,
+            n_masks    = 0,          # filled in by classify_objects()
         ))
         accepted += 1
 
@@ -339,7 +342,7 @@ def cluster_and_measure(pcd: o3d.geometry.PointCloud):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 2-D RENDERING
+# 2-D RENDERING  (top-down XY projection)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def render_cluster_to_image(cluster: o3d.geometry.PointCloud,
@@ -347,14 +350,7 @@ def render_cluster_to_image(cluster: o3d.geometry.PointCloud,
     """
     Project a single cluster onto a 2-D top-down image (XY plane).
 
-    Strategy
-    --------
-    • Normalise XY to [0, size-1] pixel coordinates.
-    • Colour each pixel with the point's RGB (or solid orange if no colours).
-    • Return a PIL Image (RGB).
-
-    The top-down view reliably shows the footprint + colours for both cones
-    and barricades and does not require an OpenGL window.
+    Returns a PIL Image (RGB, square, `size` × `size` pixels).
     """
     try:
         from PIL import Image as PILImage
@@ -364,66 +360,79 @@ def render_cluster_to_image(cluster: o3d.geometry.PointCloud,
     pts = np.asarray(cluster.points)          # (N, 3)
 
     if cluster.has_colors():
-        cols = (np.asarray(cluster.colors) * 255).astype(np.uint8)   # (N, 3)
+        cols = (np.asarray(cluster.colors) * 255).astype(np.uint8)
     else:
-        cols = np.full((len(pts), 3), [255, 115, 0], dtype=np.uint8)  # orange
+        cols = np.full((len(pts), 3), [255, 115, 0], dtype=np.uint8)  # safety orange
 
-    # Normalise XY to [0, size-1]
+    # Normalise XY to [0, size-1] pixel space
     xy   = pts[:, :2]
     mins = xy.min(axis=0)
     maxs = xy.max(axis=0)
     span = maxs - mins
-    span[span == 0] = 1.0   # avoid /0 for degenerate cases
+    span[span == 0] = 1.0   # guard against degenerate single-point spans
 
     px = ((xy - mins) / span * (size - 1)).astype(int)
 
-    # Build image — later points overwrite earlier ones (fine for our use case)
-    img_arr = np.full((size, size, 3), 40, dtype=np.uint8)   # dark grey background
-    img_arr[size - 1 - px[:, 1], px[:, 0]] = cols            # flip Y so up=up
+    img_arr = np.full((size, size, 3), 40, dtype=np.uint8)   # dark-grey background
+    img_arr[size - 1 - px[:, 1], px[:, 0]] = cols            # flip Y so up = up
 
-    # FIX 1: drop the deprecated `mode=` kwarg; uint8 (H,W,3) is auto-detected as RGB
     return PILImage.fromarray(img_arr)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CLASSIFICATION  (Grounding-DINO / SAM3 via HuggingFace)
+# CLASSIFICATION  —  SAM3  (facebook/sam3 via HuggingFace Transformers)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _load_grounding_dino():
+def _load_sam3():
     """
-    Load Grounding-DINO (the open-vocabulary detector used inside SAM3)
-    from HuggingFace Transformers.  Downloads weights on first run (~700 MB).
+    Load Sam3Model + Sam3Processor from HuggingFace.
+    Downloads weights on the first run (~2 GB for the base checkpoint).
+
+    Returns (processor, model, device).
     """
     try:
-        from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
+        from transformers import Sam3Processor, Sam3Model
         import torch
     except ImportError:
         sys.exit(
-            "transformers and torch are required for classification.\n"
+            "transformers and torch are required for SAM3 classification.\n"
             "  pip install torch torchvision transformers"
         )
 
-    print(f"[classify] Loading model  '{DETECTION_MODEL_ID}'  from HuggingFace …")
-    processor = AutoProcessor.from_pretrained(DETECTION_MODEL_ID)
-    model     = AutoModelForZeroShotObjectDetection.from_pretrained(DETECTION_MODEL_ID)
-
     import torch
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model  = model.to(device)
+
+    print(f"[classify] Loading SAM3  '{SAM3_MODEL_ID}'  from HuggingFace …")
+    processor = Sam3Processor.from_pretrained(SAM3_MODEL_ID)
+    model     = Sam3Model.from_pretrained(SAM3_MODEL_ID).to(device)
     model.eval()
-    print(f"[classify] Model loaded  (device: {device})")
+    print(f"[classify] SAM3 loaded  (device: {device})")
     return processor, model, device
 
 
 def classify_objects(objects: list,
                      prompts: list     = DETECTION_PROMPTS,
-                     box_thresh: float = DETECTION_BOX_THRESH):
+                     box_thresh: float = DETECTION_BOX_THRESH,
+                     mask_thresh: float = DETECTION_MASK_THRESH):
     """
     For every accepted cluster:
-      1. Render a top-down 2-D image.
-      2. Run Grounding-DINO zero-shot detection with the given text prompts.
-      3. If a prompt is detected above box_thresh, update obj['class_name']
-         and obj['confidence'] with the highest-scoring label.
+      1. Render a top-down 2-D image of the cluster.
+      2. Run SAM3 instance segmentation with each text prompt in turn.
+      3. The prompt that produces the highest-confidence detection above
+         `box_thresh` wins and is assigned as the cluster's class_name.
+
+    SAM3 usage mirrors the official example:
+        inputs  = processor(images=image, text=prompt, return_tensors="pt")
+        outputs = model(**inputs)
+        results = processor.post_process_instance_segmentation(
+                      outputs,
+                      threshold=box_thresh,
+                      mask_threshold=mask_thresh,
+                      target_sizes=inputs["original_sizes"].tolist()
+                  )[0]
+        # results["masks"]  – binary masks
+        # results["boxes"]  – xyxy pixel boxes
+        # results["scores"] – confidence scores
 
     Modifies `objects` in-place and returns it.
     """
@@ -432,78 +441,78 @@ def classify_objects(objects: list,
 
     try:
         import torch
-        from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
+        from transformers import Sam3Processor, Sam3Model   # noqa: F401
     except ImportError:
         print("[classify] WARNING: transformers / torch not installed – "
-              "skipping classification step.")
+              "skipping SAM3 classification step.")
         return objects
 
-    processor, model, device = _load_grounding_dino()
+    processor, model, device = _load_sam3()
 
-    # Grounding-DINO expects a single dot-separated prompt string
-    # e.g. "cone . barricade ."
-    text_prompt = " . ".join(prompts) + " ."
+    import torch  # re-import inside function scope for clarity
 
-    print(f"[classify] Text prompt   : '{text_prompt}'")
-    print(f"[classify] Box threshold : {box_thresh}")
+    print(f"[classify] Prompts       : {prompts}")
+    print(f"[classify] Score thresh  : {box_thresh}")
+    print(f"[classify] Mask thresh   : {mask_thresh}")
 
     for obj in objects:
         idx     = obj["index"]
         cluster = obj["cluster"]
 
-        # ── 1. Render ─────────────────────────────────────────────────────────
+        # ── 1. Render cluster → PIL image ─────────────────────────────────────
         image = render_cluster_to_image(cluster, size=RENDER_IMAGE_SIZE)
 
-        # ── 2. Inference ──────────────────────────────────────────────────────
-        import torch
-        inputs = processor(images=image, text=text_prompt, return_tensors="pt")
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+        best_label  = None
+        best_score  = -1.0
+        best_n_masks = 0
 
-        with torch.no_grad():
-            outputs = model(**inputs)
-
-        # Post-process → boxes + scores + labels per image
-        target_sizes = torch.tensor([image.size[::-1]], device=device)  # (H, W)
-
-        # FIX 2: use `threshold=` (single param) instead of the removed
-        # `box_threshold=` / `text_threshold=` keyword arguments.
-        results = processor.post_process_grounded_object_detection(
-            outputs,
-            inputs["input_ids"],
-            threshold    = box_thresh,
-            target_sizes = target_sizes,
-        )[0]   # single image → first (and only) result
-
-        scores = results["scores"].cpu().numpy()   # (K,)
-        labels = results["labels"]                 # list[str]
-
-        # ── 3. Pick the best detection ────────────────────────────────────────
-        if len(scores) == 0:
-            print(f"[classify] Object #{idx:03d}  →  no match  "
-                  f"(class kept as '{obj['class_name']}')")
-            continue
-
-        best_i     = int(np.argmax(scores))
-        best_label = labels[best_i].strip().lower()
-        best_score = float(scores[best_i])
-
-        # Accept only if the label matches one of our prompts
-        matched_prompt = None
+        # ── 2. Query SAM3 once per prompt, keep the best match ────────────────
         for prompt in prompts:
-            if prompt.lower() in best_label:
-                matched_prompt = prompt
-                break
+            inputs = processor(
+                images=image,
+                text=prompt,
+                return_tensors="pt",
+            )
+            inputs = {k: v.to(device) for k, v in inputs.items()}
 
-        if matched_prompt is None:
-            print(f"[classify] Object #{idx:03d}  →  detected '{best_label}' "
-                  f"(score={best_score:.2f}) but not in prompts – kept as "
-                  f"'{obj['class_name']}'")
-            continue
+            with torch.no_grad():
+                outputs = model(**inputs)
 
-        obj["class_name"] = matched_prompt
-        obj["confidence"] = best_score
-        print(f"[classify] Object #{idx:03d}  →  '{matched_prompt}'  "
-              f"(confidence={best_score:.2f})")
+            # post_process_instance_segmentation returns a list (one per image)
+            results = processor.post_process_instance_segmentation(
+                outputs,
+                threshold      = box_thresh,
+                mask_threshold = mask_thresh,
+                target_sizes   = inputs["original_sizes"].tolist(),
+            )[0]   # single image → first element
+
+            scores  = results["scores"]    # Tensor (K,)
+            n_found = len(scores)
+
+            if n_found == 0:
+                print(f"[classify] Object #{idx:03d}  prompt='{prompt}'  "
+                      f"→  no detections above threshold")
+                continue
+
+            top_score = float(scores.max().cpu())
+            print(f"[classify] Object #{idx:03d}  prompt='{prompt}'  "
+                  f"→  {n_found} mask(s)  top_score={top_score:.3f}")
+
+            if top_score > best_score:
+                best_score   = top_score
+                best_label   = prompt
+                best_n_masks = n_found
+
+        # ── 3. Assign the winning label ───────────────────────────────────────
+        if best_label is not None:
+            obj["class_name"] = best_label
+            obj["confidence"] = best_score
+            obj["n_masks"]    = best_n_masks
+            print(f"[classify] Object #{idx:03d}  ✔  class='{best_label}'  "
+                  f"confidence={best_score:.3f}  masks={best_n_masks}")
+        else:
+            print(f"[classify] Object #{idx:03d}  –  no prompt matched; "
+                  f"kept as '{obj['class_name']}'")
 
     return objects
 
@@ -516,16 +525,15 @@ def save_objects(objects: list, output_dir: str):
     """
     Save every detected object as:
         <output_dir>/<class_name>_NNN.ply        (point cloud)
-        <output_dir>/<class_name>_NNN_view.png   (2-D render)
+        <output_dir>/<class_name>_NNN_view.png   (2-D top-down render)
         <output_dir>/summary.csv                 (measurements + location + class)
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    # Track per-class counters so names are cone_000, cone_001, barricade_000 …
     class_counters: dict = {}
 
     csv_rows = [
-        "index,cluster_label,class_name,confidence,"
+        "index,cluster_label,class_name,confidence,n_masks,"
         "centroid_x_m,centroid_y_m,centroid_z_m,"
         "height_cm,height_ft,"
         "width_cm,width_ft,"
@@ -537,12 +545,13 @@ def save_objects(objects: list, output_dir: str):
         idx        = obj["index"]
         class_name = obj["class_name"]
         conf       = obj["confidence"]
+        n_masks    = obj["n_masks"]
 
-        # Build a unique filename per class
+        # Unique filename per class  (cone_000, cone_001, barricade_000, …)
         class_counters.setdefault(class_name, 0)
         class_idx = class_counters[class_name]
         class_counters[class_name] += 1
-        stem      = f"{class_name}_{class_idx:03d}"
+        stem = f"{class_name}_{class_idx:03d}"
 
         # ── point cloud ──────────────────────────────────────────────────────
         ply_path = os.path.join(output_dir, f"{stem}.ply")
@@ -563,7 +572,7 @@ def save_objects(objects: list, output_dir: str):
         h, w, l    = obj["height_m"], obj["width_m"], obj["length_m"]
         cx, cy, cz = obj["centroid"]
         csv_rows.append(
-            f"{idx},{obj['label']},{class_name},{conf:.3f},"
+            f"{idx},{obj['label']},{class_name},{conf:.3f},{n_masks},"
             f"{cx:.4f},{cy:.4f},{cz:.4f},"
             f"{h*M_TO_CM:.2f},{h*M_TO_FEET:.4f},"
             f"{w*M_TO_CM:.2f},{w*M_TO_FEET:.4f},"
@@ -581,7 +590,6 @@ def save_objects(objects: list, output_dir: str):
 # OPTIONAL VISUALISATION
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Distinct colours for up to 10 objects; cycles if more exist.
 _PALETTE = [
     [1.00, 0.45, 0.00],   # orange
     [0.20, 0.60, 1.00],   # blue
@@ -605,12 +613,12 @@ def visualise(original_pcd, objects, ground_model):
     vis_items.append(grey)
 
     for obj in objects:
-        colour = _PALETTE[obj["index"] % len(_PALETTE)]
+        colour   = _PALETTE[obj["index"] % len(_PALETTE)]
         coloured = o3d.geometry.PointCloud(obj["cluster"])
         coloured.paint_uniform_color(colour)
         vis_items.append(coloured)
 
-        bbox = obj["bbox"]
+        bbox       = obj["bbox"]
         bbox.color = tuple(colour)
         vis_items.append(bbox)
 
@@ -640,14 +648,15 @@ def parse_args():
     p.add_argument("--visualise", action="store_true",
         help="Open interactive 3-D viewer after processing")
     p.add_argument("--no-classify", action="store_true",
-        help="Skip the Grounding-DINO classification step")
+        help="Skip the SAM3 classification step")
     p.add_argument("--prompts", nargs="+", default=DETECTION_PROMPTS,
-        help="Text prompts for zero-shot classification  "
-             "(default: cone barricade)")
+        help="Text prompts for SAM3 zero-shot segmentation  (default: cone barricade)")
     p.add_argument("--box-thresh", type=float, default=DETECTION_BOX_THRESH,
-        help="Confidence threshold for Grounding-DINO detections")
+        help="SAM3 score threshold – detections below this are ignored")
+    p.add_argument("--mask-thresh", type=float, default=DETECTION_MASK_THRESH,
+        help="SAM3 mask binarisation threshold")
 
-    # Overridable thresholds
+    # Overridable geometry thresholds
     p.add_argument("--ground-threshold", type=float, default=GROUND_DISTANCE_THRESHOLD,
         help="RANSAC distance threshold for ground plane (m)")
     p.add_argument("--above-margin", type=float, default=ABOVE_GROUND_MARGIN,
@@ -672,7 +681,6 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # Apply CLI overrides to module-level constants
     global GROUND_DISTANCE_THRESHOLD, ABOVE_GROUND_MARGIN
     global DBSCAN_EPS, DBSCAN_MIN_POINTS
     global MIN_OBJ_DIMENSION, MAX_OBJ_DIMENSION, MIN_OBJ_HEIGHT
@@ -702,14 +710,15 @@ def main():
     # ── 4. Cluster + measure ──────────────────────────────────────────────────
     objects = cluster_and_measure(colour_pcd)
 
-    # ── 5. Classify with Grounding-DINO (SAM3) ────────────────────────────────
+    # ── 5. Classify with SAM3 ─────────────────────────────────────────────────
     if not args.no_classify and objects:
-        print(f"\n[classify] Running zero-shot classification "
+        print(f"\n[classify] Running SAM3 zero-shot segmentation "
               f"with prompts {args.prompts} …")
         objects = classify_objects(
             objects,
-            prompts    = args.prompts,
-            box_thresh = args.box_thresh,
+            prompts     = args.prompts,
+            box_thresh  = args.box_thresh,
+            mask_thresh = args.mask_thresh,
         )
 
     # ── 6. Save ───────────────────────────────────────────────────────────────
@@ -725,7 +734,6 @@ def main():
 
     print("=" * len(banner))
     print(f"  Done.  {len(objects)} object(s) detected.")
-    # Print final class summary
     from collections import Counter
     counts = Counter(obj["class_name"] for obj in objects)
     for cls, cnt in sorted(counts.items()):
